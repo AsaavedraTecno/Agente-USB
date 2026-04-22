@@ -1,0 +1,37 @@
+{
+  "source": {
+    "agent_id": "PORTABLE-001",
+    "hostname": "WH-178",
+    "os": "windows",
+    "version": "1.0.0",
+    "confidence": "pjl_basic",
+    "collection_method": "usb_direct",
+    "connected_via": "usb",
+    "timestamp": "2026-04-21T20:22:32Z"
+  },
+  "printer": {
+    "ip": null,
+    "brand": "Unknown",
+    "model": "TIMED",
+    "serial": "",
+    "mac": null,
+    "trays": []
+  },
+  "counters": {
+    "total_pages": null,
+    "print_pages": null,
+    "copy_pages": null,
+    "fax_pages": null,
+    "simplex_pages": null,
+    "duplex_pages": null,
+    "scan_pages": null
+  },
+  "supplies": [],
+  "device_alerts": [],
+  "metrics": {
+    "poll_started_at": "2026-04-21T20:22:32Z",
+    "poll_completed_at": "2026-04-21T20:22:42Z",
+    "poll_duration_ms": 10488,
+    "success_rate": 1
+  }
+}

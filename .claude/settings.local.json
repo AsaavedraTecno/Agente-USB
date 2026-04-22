@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pandoc \"C:/Users/asaavedra/Downloads/informe_agente_usb.docx\" -t markdown)",
+      "Bash(python \"C:/Users/asaavedra/AppData/Roaming/Claude/local-agent-mode-sessions/skills-plugin/7bc6eaba-4174-4b10-9a63-2948c8c344e4/0c193542-0286-42ee-927b-405955b9c869/skills/docx/scripts/office/unpack.py\" \"C:/Users/asaavedra/Downloads/informe_agente_usb.docx\" \"C:/Users/asaavedra/Downloads/informe_agente_usb_unpacked/\")",
+      "Bash(pip install *)",
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import sys; sys.stdout.buffer.write\\(sys.stdin.buffer.read\\(\\)\\)\")",
+      "Bash(go version *)",
+      "Bash(where go *)",
+      "Bash(go mod *)",
+      "Bash(go get *)",
+      "Bash(go build *)",
+      "Bash(go run *)",
+      "Bash(powershell -NoProfile -Command \"Get-NetIPAddress | Select-Object IPAddress, InterfaceAlias | Format-Table -AutoSize\")",
+      "Bash(powershell -NoProfile -Command \"Get-NetAdapter | Select-Object Name, InterfaceDescription, Status | Format-Table -AutoSize\")",
+      "Bash(./agent.exe)",
+      "Bash(powershell -NoProfile -NonInteractive -Command \"Get-ChildItem 'HKLM:\\\\SYSTEM\\\\CurrentControlSet\\\\Control\\\\Print\\\\Printers\\\\Samsung ML-375x Series PCL 6\\\\PrinterDriverData' | Select-Object -ExpandProperty PSChildName\")",
+      "Bash(powershell -NoProfile -NonInteractive -Command \"Get-ItemProperty 'HKLM:\\\\SYSTEM\\\\CurrentControlSet\\\\Control\\\\Print\\\\Printers\\\\Samsung ML-375x Series PCL 6\\\\PrinterDriverData' | Format-List *\")",
+      "Bash(powershell -NoProfile -NonInteractive -Command ' *)",
+      "Bash(powershell -NoProfile -NonInteractive -Command \"Get-PrinterProperty -PrinterName 'Samsung ML-375x Series PCL 6' -ErrorAction SilentlyContinue | Select-Object PropertyName, Value | ConvertTo-Json -Compress\")",
+      "Bash(powershell -NoProfile -NonInteractive -Command 'Get-WmiObject -Class Win32_PerfRawData_Spooler_PrintQueue | Where-Object { $_.Name -like '\\\\''*M332*'\\\\'' -or $_.Name -like '\\\\''*382*'\\\\'' } | Select-Object Name, TotalJobsPrinted, TotalPagesPrinted | ConvertTo-Json -Compress')"
+    ]
+  }
+}
