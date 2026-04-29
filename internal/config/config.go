@@ -16,6 +16,7 @@ type Config struct {
 	SNMPCommunity  string `yaml:"snmp_community"`
 	RetryInterval  int    `yaml:"retry_interval"`
 	ManualFallback bool   `yaml:"manual_fallback"`
+	BypassSpooler  bool   `yaml:"bypass_spooler"`
 	LogLevel       string `yaml:"log_level"`
 }
 
@@ -27,6 +28,7 @@ func Load(path string) *Config {
 		SNMPCommunity:  "public",
 		RetryInterval:  60,
 		ManualFallback: true,
+		BypassSpooler:  false,
 		LogLevel:       "info",
 	}
 

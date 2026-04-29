@@ -7,10 +7,12 @@
 package bidi
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 
 	"usb-agent/internal/payload"
 )
@@ -40,7 +42,9 @@ $p = Get-PrinterProperty -PrinterName '%s' -ErrorAction SilentlyContinue
 if (-not $p) { Write-Output 'null'; exit }
 $p | Select-Object PropertyName, @{N='Value';E={[string]$_.Value}} | ConvertTo-Json -Compress`, safe)
 
-	out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", script).Output()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command", script).Output()
 	if err != nil {
 		return nil, fmt.Errorf("Get-PrinterProperty: %w", err)
 	}
@@ -89,13 +93,12 @@ func parsePrinterProperties(raw string) (*Result, error) {
 			strings.Contains(name, "consumable"):
 			var lvl int
 			if n, _ := fmt.Sscanf(val, "%d", &lvl); n == 1 && lvl >= 0 && lvl <= 100 {
-				lvlCopy := lvl
 				res.Supplies = append(res.Supplies, payload.Supply{
-					Name:   p.PropertyName,
-					Color:  "black",
-					Type:   "toner",
-					Level:  &lvlCopy,
-					Status: supplyStatus(lvl),
+					Name:       p.PropertyName,
+					Color:      "black",
+					Type:       "toner",
+					Percentage: payload.Float64Ptr(float64(lvl)),
+					Status:     supplyStatus(lvl),
 				})
 			}
 		}
@@ -254,7 +257,9 @@ try {
 if ($err) { Write-Output ("{""_error"":""Add-Type: $($err -replace '""',""'"")""}" ) }
 else { [BidiExtractor]::Run("%s") }`, csharpBidi, safeName)
 
-	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", psScript)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command", psScript)
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("IBidiSpl COM: %w", err)
@@ -284,13 +289,6 @@ else { [BidiExtractor]::Run("%s") }`, csharpBidi, safeName)
 			fmt.Sscanf(v, "%d", &res.PageCount)
 		case strings.Contains(k, "SerialNumber"):
 			res.Serial = v
-		case strings.Contains(k, "Supplies#1.Level"):
-			var lvl int
-			fmt.Sscanf(v, "%d", &lvl)
-			data["_s1lvl"] = v
-			_ = lvl
-		case strings.Contains(k, "Supplies#2.Level"):
-			data["_s2lvl"] = v
 		}
 	}
 
@@ -302,21 +300,20 @@ else { [BidiExtractor]::Run("%s") }`, csharpBidi, safeName)
 		if !okL {
 			continue
 		}
-		var lvl int
-		if n, _ := fmt.Sscanf(lvlStr, "%d", &lvl); n == 0 {
+		var level int
+		if n, _ := fmt.Sscanf(lvlStr, "%d", &level); n == 0 {
 			continue
 		}
-		colorantName := data[nameKey]
-		if colorantName == "" {
-			colorantName = "Black"
+		supplyName := data[nameKey]
+		if supplyName == "" {
+			supplyName = "Black"
 		}
-		lvlCopy := lvl
 		res.Supplies = append(res.Supplies, payload.Supply{
-			Name:   colorantName + " Toner",
-			Color:  strings.ToLower(colorantName),
-			Type:   "toner",
-			Level:  &lvlCopy,
-			Status: supplyStatus(lvl),
+			Name:       supplyName + " Toner",
+			Color:      strings.ToLower(supplyName),
+			Type:       "toner",
+			Percentage: payload.Float64Ptr(float64(level)),
+			Status:     supplyStatus(level),
 		})
 	}
 
@@ -326,10 +323,10 @@ else { [BidiExtractor]::Run("%s") }`, csharpBidi, safeName)
 func supplyStatus(pct int) string {
 	switch {
 	case pct <= 10:
-		return "critical"
+		return "Cr\u00edtico"
 	case pct <= 25:
-		return "warning"
+		return "Bajo"
 	default:
-		return "ok"
+		return "OK"
 	}
 }

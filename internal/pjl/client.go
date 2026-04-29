@@ -15,6 +15,7 @@ import (
 	"unsafe"
 
 	"usb-agent/internal/payload"
+	"usb-agent/internal/spooler"
 	"usb-agent/internal/usbraw"
 )
 
@@ -45,41 +46,94 @@ type docInfo1W struct {
 
 // Result contiene los datos extraídos vía PJL.
 type Result struct {
-	Model      string
-	Brand      string
-	Serial     string
-	Status     string
-	Online     bool
-	PageCount  int64
-	Supplies   []payload.Supply
-	Trays      []payload.Tray
-	Alerts     []payload.Alert
-	Confidence string // pjl_full | pjl_basic
+	Model           string
+	Brand           string
+	Serial          string
+	PCBMSerial      string // LAS_PCBM_SN — base de la MAC address de red
+	PrinterHostname string // BRW/BRN + PCBM_SN (derivado)
+	NetworkConn     string // LAS_NETWORK_CONNECTION: WLAN/LAN
+	Status          string
+	Online          bool
+	PageCount       int64
+	PrintPages      int64
+	CopyPages       int64
+	DuplexPages     int64
+	DuplexSet       bool // true cuando LAS_PAGECOUNT_TOTAL_DX fue recibido (incluso si es 0)
+	ScanPages       int64
+	CoverageLast    float64
+	CoverageAvg     float64 // LAS_COVERAGE_ACC — cobertura promedio histórica
+	UptimeMinutes   int64   // LAS_TOTALTIME_POWER_ON en minutos
+	PowerOnCount    int64   // LAS_POWER_ON_COUNT — número de encendidos
+	EngineCycles    int64   // LAS_DEVROLLER_COUNT — contador mecánico del rodillo
+	JamTotal        int64   // LAS_JAMCOUNT
+	JamTray1        int64   // LAS_JAMCOUNTT1
+	JamTray2        int64   // LAS_JAMCOUNTT2
+	JamTrayMP       int64   // LAS_JAMCOUNTMP
+	JamInside       int64   // LAS_JAMCOUNTINSIDE
+	JamRear         int64   // LAS_JAMCOUNTREAR
+	MAC             string
+	IP              string
+	Firmware        string
+	HasVariables    bool
+	Supplies        []payload.Supply
+	Trays           []payload.Tray
+	Alerts          []payload.Alert
+	Confidence      string // pjl_full | pjl_basic
 }
 
 // Extract envía comandos PJL al nombre de impresora dado.
-// Prueba tres mecanismos en orden hasta obtener respuesta bidireccional:
-// 1. Port monitor directo (USB001:)
-// 2. Device path raw via SetupDi (comunicación directa al USB)
-// 3. Job RAW via spooler + ReadPrinter (último recurso)
-func Extract(printerName, portName string, timeoutMs int) (*Result, error) {
+//
+// El spooler de Windows compite por los bytes del endpoint bulk-IN USB: cuando la
+// impresora responde a BRSUPPLY (~8-10s después del write), el spooler puede leer
+// esos bytes antes que nosotros. Por eso bypass_spooler=true detiene el servicio
+// ANTES de abrir el device, garantizando acceso exclusivo al canal bidireccional.
+//
+// Orden de intento:
+//  1. USB raw con spooler detenido (30s timeout) — si bypass_spooler habilitado
+//  2. USB raw con spooler activo (timeout normal) — fallback o si bypass falla/no admin
+//  3. Job RAW via spooler + ReadPrinter — último recurso
+func Extract(printerName, portName string, timeoutMs int, bypassSpooler bool) (*Result, error) {
 	pjlCmd := buildPJLQuery()
 
-	// Intento 1: port monitor directo
-	if res, err := tryPortMonitor(portName+":", timeoutMs); err == nil {
-		return res, nil
+	// Intento 1: detener spooler PRIMERO para acceso exclusivo al bulk-IN USB.
+	// Sin spooler activo, la respuesta BRSUPPLY llega sin competencia.
+	if bypassSpooler {
+		log.Printf("[PJL-Raw] Deteniendo Spooler para acceso exclusivo al USB...")
+		if stopErr := spooler.Stop(); stopErr == nil {
+			log.Printf("[PJL-Raw] Spooler detenido. Esperando que libere el puerto...")
+			time.Sleep(2 * time.Second) // dar tiempo a que se cierren los handles
+
+			res, usbErr := tryUSBRaw(pjlCmd, 30000) // ventana de 30s para capturar BRSUPPLY
+
+			log.Printf("[PJL-Raw] Restaurando Spooler...")
+			spooler.Start()
+
+			if usbErr == nil {
+				return res, nil
+			}
+			log.Printf("[PJL-Raw] USB exclusivo falló: %v — continuando sin bypass", usbErr)
+		} else {
+			log.Printf("[PJL-Raw] No se pudo detener Spooler (¿se ejecuta como Admin?): %v", stopErr)
+		}
 	}
 
-	// Intento 2: device path USB raw via SetupDi (el más confiable para lectura)
+	// Intento 2: USB raw con spooler activo (datos parciales posibles por competencia)
 	if res, err := tryUSBRaw(pjlCmd, timeoutMs); err == nil {
 		return res, nil
 	}
 
-	// Intento 3: job RAW via spooler (solo escritura; ReadPrinter como último recurso)
+	// Intento 3: job RAW via spooler + ReadPrinter (último recurso)
 	return extractViaSpool(printerName, timeoutMs)
 }
 
 // tryUSBRaw enumera USB printer device paths via SetupDi y envía PJL directamente.
+// Estrategia de dos fases:
+//  1. Lectura fresca: espera hasta ~10 s que la impresora responda al comando recién enviado.
+//  2. Fallback al buffer drenado: la Brother HL-L5xxx tarda ~5-7 s en preparar su respuesta;
+//     el driver USB retorna ERROR_NO_DATA inmediatamente, así que la respuesta llega después
+//     de que la ventana de lectura se cierra y queda en el buffer hasta la siguiente ejecución.
+//     Esos bytes drenados son una respuesta PJL válida del ciclo anterior y se usan como
+//     fallback cuando la lectura fresca no obtiene datos a tiempo.
 func tryUSBRaw(pjlCmd string, timeoutMs int) (*Result, error) {
 	paths, err := usbraw.FindDevicePaths()
 	if err != nil || len(paths) == 0 {
@@ -87,21 +141,68 @@ func tryUSBRaw(pjlCmd string, timeoutMs int) (*Result, error) {
 	}
 
 	for _, path := range paths {
-		data, err := usbraw.SendPJLAndRead(path, pjlCmd, timeoutMs)
+		isComplete := func(data []byte, isIdle bool) bool {
+			if !isIdle {
+				return false
+			}
+			res := parsePJL(data)
+			if res.Model == "" {
+				return false
+			}
+
+			// Esperar siempre hasta que el bloque VARIABLES termine (marcado con \x0c).
+			// Como es el último comando que enviamos, si vemos \x0c después de él,
+			// la impresora ha respondido a todo.
+			idx := bytes.Index(data, []byte("@PJL INFO VARIABLES"))
+			if idx != -1 {
+				// Buscar \x0c después de la cabecera
+				if bytes.IndexByte(data[idx:], '\x0c') != -1 {
+					return len(res.Supplies) > 0 || res.PageCount > 0
+				}
+			}
+
+			// Si la impresora no soporta nada de lo anterior, esperará al timeout (30s) por seguridad.
+			return false
+		}
+
+		fresh, drained, err := usbraw.SendPJLAndRead(path, pjlCmd, timeoutMs, isComplete)
 		if err != nil {
 			log.Printf("[PJL-Raw] %s: %v", path, err)
 			continue
 		}
-		if len(data) > 0 {
-			log.Printf("[PJL-Raw] Respuesta de %s: %d bytes", path, len(data))
-			res := parsePJL(data)
-			// Si el parser no extrajo nada útil, retornar el error para ver el dump
-			if res.Model == "" && res.PageCount == 0 && len(res.Supplies) == 0 && res.Status == "" {
-				log.Printf("[PJL-Raw] Respuesta no parseada como PJL — ver dump arriba para analizar formato")
-				return nil, fmt.Errorf("respuesta de %d bytes no es PJL estándar", len(data))
+
+		resFresh := parsePJL(fresh)
+		var combined []byte
+		var source string
+		if resFresh.Model != "" && (len(resFresh.Supplies) > 0 || resFresh.PageCount > 0) {
+			// La respuesta fresca está completa. Descartamos el buffer previo porque podría
+			// estar corrupto o pisado por el spooler.
+			combined = fresh
+			source = fmt.Sprintf("%d bytes frescos", len(fresh))
+			if len(drained) > 0 {
+				log.Printf("[PJL-Raw] Descartando %d bytes previos (fresca ya está completa)", len(drained))
 			}
+		} else {
+			// Combinar drained + fresh como fallback (modo sin bypass spooler)
+			combined = append(drained, fresh...)
+			if len(combined) == 0 {
+				continue
+			}
+			if len(drained) > 0 && len(fresh) > 0 {
+				source = fmt.Sprintf("%d bytes previos + %d bytes frescos", len(drained), len(fresh))
+			} else if len(drained) > 0 {
+				source = fmt.Sprintf("%d bytes del buffer previo", len(drained))
+			} else {
+				source = fmt.Sprintf("%d bytes frescos", len(fresh))
+			}
+		}
+
+		res := parsePJL(combined)
+		if res.Model != "" || res.PageCount != 0 || len(res.Supplies) != 0 || res.Status != "" || res.Serial != "" {
+			log.Printf("[PJL-Raw] %s → datos OK (%s)", path, source)
 			return res, nil
 		}
+		log.Printf("[PJL-Raw] %s bytes combinados no son PJL estándar — ver dump", source)
 	}
 
 	return nil, fmt.Errorf("USB raw: ningún device respondió datos PJL")
@@ -220,17 +321,24 @@ func extractViaSpool(printerName string, timeoutMs int) (*Result, error) {
 }
 
 func buildPJLQuery() string {
-	// Samsung ML-375x: DINQUIRE PAGECOUNT e INFO SUPPLIES devuelven "?" (sin chip CRUM).
-	// INFO VARIABLES descubre qué variables soporta el firmware de esta unidad.
-	// INQUIRE PAGECOUNT (sin D) es la variante síncrona; algunos firmwares lo responden.
+	// Order matters: BRSUPPLY and PAGECOUNT come before the large VARIABLES block.
+	// Brother HL-series returns "?" for standard SUPPLIES but responds to BRSUPPLY.
+	// VARIABLES generates a huge response (~4KB+) that can overflow read buffers if placed first.
 	return uel + "@PJL" + crlf +
 		"@PJL INFO ID" + crlf +
 		"@PJL INFO STATUS" + crlf +
 		"@PJL INFO SUPPLIES" + crlf +
-		"@PJL INFO CONFIG" + crlf +
-		"@PJL INFO VARIABLES" + crlf +
+		"@PJL INFO BRSUPPLY" + crlf +
+		"@PJL INFO PRODINFO" + crlf +
+		"@PJL INFO NETWORK" + crlf +
+		"@PJL INFO BRNETINFO" + crlf +
+		"@PJL INQUIRE IPADDRESS" + crlf +
+		"@PJL INQUIRE IPV4" + crlf +
+		"@PJL INQUIRE MACADDRESS" + crlf +
 		"@PJL DINQUIRE PAGECOUNT" + crlf +
 		"@PJL INQUIRE PAGECOUNT" + crlf +
+		"@PJL INFO CONFIG" + crlf +
+		"@PJL INFO VARIABLES" + crlf +
 		uel
 }
 
@@ -280,6 +388,7 @@ func parsePJL(data []byte) *Result {
 	var configSub string // subsección dentro de CONFIG (trays, papers, etc.)
 	var varSub string    // subsección dentro de VARIABLES (e.g. mediasource)
 	var cur *supplyInProgress
+	var brData map[string]string // accumulated LAS_ key-value pairs from BRSUPPLY
 
 	flush := func() {
 		if cur != nil {
@@ -339,8 +448,15 @@ func parsePJL(data []byte) *Result {
 			if key == "" && res.Model == "" && strings.HasPrefix(trimmed, `"`) {
 				model := strings.Trim(trimmed, `"`)
 				if model != "" && model != "?" {
-					res.Model = model
-					res.Brand = inferBrand(model)
+					// Brother: "HL-L5210DN series:84U-L0A:Ver.1.27" → solo el nombre
+					if idx := strings.Index(model, ":"); idx > 0 {
+						rest := model[idx+1:]
+						if strings.Contains(strings.ToLower(rest), "ver.") {
+							model = model[:idx]
+						}
+					}
+					res.Model = strings.TrimSpace(model)
+					res.Brand = inferBrand(res.Model)
 				}
 			}
 
@@ -348,7 +464,10 @@ func parsePJL(data []byte) *Result {
 		case "STATUS":
 			switch key {
 			case "CODE":
-				if val != "" && val != "10001" && val != "10000" {
+				// Códigos normales/informativos que no representan error:
+				// 10000=Ready, 10001=Offline, 40000=Waiting/Warming up (Brother)
+				normalCodes := map[string]bool{"10000": true, "10001": true, "40000": true}
+				if val != "" && !normalCodes[val] {
 					res.Alerts = append(res.Alerts, payload.Alert{
 						Code:    val,
 						Message: "PJL status code: " + val,
@@ -425,11 +544,9 @@ func parsePJL(data []byte) *Result {
 
 			if isIndented && configSub == "trays" {
 				name := trimmed
-				id := len(res.Trays) + 1
 				res.Trays = append(res.Trays, payload.Tray{
-					ID:     id,
 					Name:   normalizeTrayName(name),
-					Status: "ok",
+					Status: "OK",
 				})
 				continue
 			}
@@ -440,6 +557,16 @@ func parsePJL(data []byte) *Result {
 				if s != "" && s != "?" {
 					res.Serial = s
 				}
+			}
+
+		// ── INFO BRSUPPLY (Brother proprietary) ───────────────────────────
+		// Accumulate all LAS_ key-value pairs; processed after the loop.
+		case "BRSUPPLY":
+			if key != "" {
+				if brData == nil {
+					brData = make(map[string]string)
+				}
+				brData[strings.ToUpper(key)] = strings.Trim(val, `" `)
 			}
 
 		// ── DINQUIRE/INQUIRE PAGECOUNT ────────────────────────────────────
@@ -456,10 +583,39 @@ func parsePJL(data []byte) *Result {
 				}
 			}
 
+		// ── NETWORK INFO ──────────────────────────────────────────────────
+		case "NETWORK", "BRNETINFO", "PRODINFO":
+			if key == "IPADDRESS" || key == "IP_ADDRESS" || key == "LAS_NETWORK_IPADDRESS" || key == "IPV4" {
+				res.IP = strings.Trim(val, `" `)
+			} else if key == "MACADDRESS" || key == "MAC_ADDRESS" || key == "LAS_NETWORK_MACADDRESS" || key == "MAC" {
+				res.MAC = strings.Trim(val, `" `)
+			}
+
+		case "INQUIRE_IPADDRESS", "INQUIRE_IPV4":
+			v := val
+			if v == "" {
+				v = trimmed
+			}
+			v = strings.Trim(v, `" `)
+			if v != "" && v != "?" && res.IP == "" {
+				res.IP = v
+			}
+
+		case "INQUIRE_MACADDRESS":
+			v := val
+			if v == "" {
+				v = trimmed
+			}
+			v = strings.Trim(v, `" `)
+			if v != "" && v != "?" && res.MAC == "" {
+				res.MAC = v
+			}
+
 		// ── INFO VARIABLES ────────────────────────────────────────────────
 		// Lista todas las variables PJL del firmware. Extrae tóner, páginas, y bandejas
 		// desde MEDIASOURCE (Samsung M332x/382x no usa IN TRAYS en CONFIG).
 		case "VARIABLES":
+			res.HasVariables = true
 			// Línea indentada: es un valor enumerado de la variable anterior
 			isIndented := strings.HasPrefix(line, "\t") || strings.HasPrefix(line, "    ")
 			if isIndented {
@@ -469,12 +625,10 @@ func parsePJL(data []byte) *Result {
 					case "DEFAULT", "AUTO", "AUTOSELECT", "MANUAL", "MANUALFEED":
 						// no es bandeja física
 					case "MPF", "MPTRAY":
-						id := len(res.Trays) + 1
-						res.Trays = append(res.Trays, payload.Tray{ID: id, Name: "Manual Paper Tray", Status: "ok"})
+						res.Trays = append(res.Trays, payload.Tray{Name: "Manual Paper Tray", Status: "OK"})
 					default:
 						if strings.HasPrefix(strings.ToUpper(trimmed), "TRAY") {
-							id := len(res.Trays) + 1
-							res.Trays = append(res.Trays, payload.Tray{ID: id, Name: normalizeTrayName(trimmed), Status: "ok"})
+							res.Trays = append(res.Trays, payload.Tray{Name: normalizeTrayName(trimmed), Status: "OK"})
 						}
 					}
 				}
@@ -504,6 +658,18 @@ func parsePJL(data []byte) *Result {
 					}
 				}
 			}
+			if upper == "HWADDRESS" || upper == "MACADDRESS" {
+				valClean := strings.Trim(val, `" `)
+				if valClean != "" && valClean != "?" && res.MAC == "" {
+					res.MAC = valClean
+				}
+			}
+			if upper == "IPADDRESS" || upper == "IPV4" {
+				valClean := strings.Trim(val, `" `)
+				if valClean != "" && valClean != "?" && res.IP == "" {
+					res.IP = valClean
+				}
+			}
 			if strings.Contains(upper, "TONER") || strings.Contains(upper, "SUPPLY") {
 				valClean := val
 				if idx := strings.Index(valClean, "["); idx != -1 {
@@ -515,10 +681,10 @@ func parsePJL(data []byte) *Result {
 					if len(res.Supplies) == 0 {
 						pct := int(lvl)
 						res.Supplies = append(res.Supplies, payload.Supply{
-							Name:  key,
-							Color: "black",
-							Type:  "toner",
-							Level: &pct,
+							Name:       key,
+							Color:      "black",
+							Type:       "toner",
+							Percentage: payload.Float64Ptr(float64(pct)),
 						})
 						res.Confidence = "pjl_full"
 					}
@@ -528,6 +694,9 @@ func parsePJL(data []byte) *Result {
 	}
 
 	flush()
+	if brData != nil {
+		applyBRSupplyData(res, brData)
+	}
 	return res
 }
 
@@ -565,13 +734,13 @@ func (s *supplyInProgress) build() payload.Supply {
 		levelPct = &pct
 	}
 
-	status := "ok"
+	status := "OK"
 	if levelPct != nil {
 		switch {
 		case *levelPct <= 10:
-			status = "critical"
+			status = "Cr\u00edtico"
 		case *levelPct <= 25:
-			status = "warning"
+			status = "Bajo"
 		}
 	}
 
@@ -580,11 +749,11 @@ func (s *supplyInProgress) build() payload.Supply {
 		color = "black"
 	}
 	return payload.Supply{
-		Name:   s.Name,
-		Type:   s.Type,
-		Color:  color,
-		Level:  levelPct,
-		Status: status,
+		Name:       s.Name,
+		Type:       s.Type,
+		Color:      color,
+		Percentage: payload.Float64Ptr(float64(*levelPct)),
+		Status:     status,
 	}
 }
 
@@ -606,6 +775,256 @@ func normalizeSupplyType(t string) string {
 		return "fuser"
 	default:
 		return strings.ToLower(t)
+	}
+}
+
+// applyBRSupplyData extracts all useful fields from the Brother LAS_ key-value map.
+// Brother HL-L5xxx returns TONER_REMAIN as a float (e.g. "94.00") and all counters
+// and supply lifetimes via LAS_* keys in the BRSUPPLY section.
+func applyBRSupplyData(res *Result, d map[string]string) {
+	get := func(k string) string { return d[k] }
+
+	// Identity
+	if v := get("LAS_MODEL_NAME"); v != "" && res.Model == "" {
+		res.Model = v
+		res.Brand = inferBrand(v)
+	}
+	if v := strings.TrimSpace(get("LAS_MACHINE_SN")); v != "" && v != "?" && res.Serial == "" {
+		res.Serial = v
+	}
+
+	// Total page count
+	if v := get("LAS_PAGECOUNT_TOTAL"); v != "" && res.PageCount == 0 {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			res.PageCount = n
+		}
+	}
+	if v := get("LAS_PAGECOUNT_PCPRINT"); v != "" && res.PrintPages == 0 {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			res.PrintPages = n
+		}
+	}
+	if v := get("LAS_PAGECOUNT_OTHER"); v != "" && res.CopyPages == 0 {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			res.CopyPages = n
+		}
+	}
+	if v := get("LAS_PAGECOUNT_TOTAL_DX"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			res.DuplexPages = n
+			res.DuplexSet = true
+		}
+	} else if v := get("LAS_COUNTPAGE_DX"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			res.DuplexPages = n
+			res.DuplexSet = true
+		}
+	}
+	if v := get("LAS_SCANNER_PAGE_COUNT"); v != "" && res.ScanPages == 0 {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			res.ScanPages = n
+		}
+	}
+
+	if v := get("LAS_COVERAGE_LAST"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			res.CoverageLast = f
+		}
+	}
+	if v := get("LAS_RVERSION"); v != "" && res.Firmware == "" {
+		res.Firmware = v
+	} else if v := get("LAS_VERSION"); v != "" && res.Firmware == "" {
+		res.Firmware = v
+	}
+	if v := get("LAS_TOTALTIME_POWER_ON"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			res.UptimeMinutes = n
+		}
+	}
+	if v := strings.TrimSpace(get("LAS_PCBM_SN")); v != "" && v != "?" && res.PCBMSerial == "" {
+		res.PCBMSerial = v
+		// Derivar MAC: "3BE1000312B8" → "3b:e1:00:03:12:b8"
+		if len(v) == 12 && res.MAC == "" {
+			b := strings.ToLower(v)
+			res.MAC = b[0:2] + ":" + b[2:4] + ":" + b[4:6] + ":" + b[6:8] + ":" + b[8:10] + ":" + b[10:12]
+		}
+	}
+	// Derivar hostname de impresora: BRW (WiFi) o BRN (LAN) + PCBM_SN en mayúsculas
+	if nc := get("LAS_NETWORK_CONNECTION"); nc != "" {
+		res.NetworkConn = nc
+	}
+	if res.PCBMSerial != "" && res.PrinterHostname == "" {
+		prefix := "BRN"
+		if strings.EqualFold(res.NetworkConn, "WLAN") {
+			prefix = "BRW"
+		}
+		res.PrinterHostname = prefix + strings.ToUpper(res.PCBMSerial)
+	}
+
+	if v := get("LAS_COVERAGE_ACC"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			res.CoverageAvg = f
+		}
+	}
+	if v := get("LAS_POWER_ON_COUNT"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			res.PowerOnCount = n
+		}
+	}
+	if v := get("LAS_DEVROLLER_COUNT"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			res.EngineCycles = n
+		}
+	}
+
+	// Jam counters — predicción de mantenimiento por bandeja
+	parseJam := func(key string) int64 {
+		if v := get(key); v != "" {
+			if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+				return n
+			}
+		}
+		return 0
+	}
+	res.JamTotal = parseJam("LAS_JAMCOUNT")
+	res.JamTray1 = parseJam("LAS_JAMCOUNTT1")
+	res.JamTray2 = parseJam("LAS_JAMCOUNTT2")
+	res.JamTrayMP = parseJam("LAS_JAMCOUNTMP")
+	res.JamInside = parseJam("LAS_JAMCOUNTINSIDE")
+	res.JamRear = parseJam("LAS_JAMCOUNTREAR")
+
+	// Toner level — Brother reports as float percentage e.g. "94.00"
+	if v := get("LAS_TONER_REMAIN"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 {
+			pct := int(f + 0.5)
+			if pct > 100 {
+				pct = 100
+			}
+
+			var genuine *bool
+			if gk := get("LAS_TONER_GENUINE_K"); gk != "" {
+				gen := gk == "1"
+				genuine = &gen
+			}
+			var changeCount *int
+			if cc := get("LAS_TONER_CHANGE_COUNT"); cc != "" {
+				if c, err := strconv.Atoi(cc); err == nil {
+					changeCount = &c
+				}
+			}
+			var CartridgeType *string
+			if pt := get("LAS_TONER_CHANGE_TYPE1"); pt != "" {
+				CartridgeType = &pt
+			}
+
+			var sn *string
+			if sv := get("LAS_TONER_SN"); sv != "" && sv != "?" {
+				sn = &sv
+			}
+
+			rawL := pct
+			rawM := 100
+			res.Supplies = append(res.Supplies, payload.Supply{
+				ID:            fmt.Sprintf("toner_black_.1.%d", len(res.Supplies)+1),
+				Name:          "Toner Black",
+				Type:          "toner",
+				Color:         "black",
+				Description:   "Black Toner Cartridge",
+				Percentage:    payload.Float64Ptr(float64(pct)),
+				Status:        brSupplyStatus(pct),
+				IsMeasurable:  true,
+				RawLevel:      &rawL,
+				RawMax:        &rawM,
+				Genuine:       genuine,
+				ChangeCount:   changeCount,
+				CartridgeType: CartridgeType,
+				SerialNumber:  sn,
+			})
+			res.Confidence = "pjl_brother_custom"
+		}
+	}
+
+	// Drum unit — remaining pages via LAS_NEXTCARE_DRUM / LAS_DRUM_LIFE_PERIOD
+	if remain, life := get("LAS_NEXTCARE_DRUM"), get("LAS_DRUM_LIFE_PERIOD"); remain != "" && life != "" {
+		if r, err1 := strconv.ParseInt(remain, 10, 64); err1 == nil {
+			if l, err2 := strconv.ParseInt(life, 10, 64); err2 == nil && l > 0 {
+				pct := int((r * 100) / l)
+				if pct > 100 {
+					pct = 100
+				}
+				if pct < 0 {
+					pct = 0
+				}
+				rawL := int(r)
+				rawM := int(l)
+				res.Supplies = append(res.Supplies, payload.Supply{
+					ID:           fmt.Sprintf("drum_.1.%d", len(res.Supplies)+1),
+					Name:         "Drum Black",
+					Description:  "Black Drum Unit",
+					Type:         "drum",
+					Color:        "black",
+					Percentage:   payload.Float64Ptr(float64(pct)),
+					Status:       brSupplyStatus(pct),
+					IsMeasurable: true,
+					RawLevel:     &rawL,
+					RawMax:       &rawM,
+				})
+			}
+		}
+	}
+
+	// Fuser and paper-feed kits — remain / life_period pairs
+	kits := []struct{ remain, life, name, typ string }{
+		{"LAS_FUSER_REMAIN", "LAS_FUSER_LIFE_PERIOD", "Fuser Kit", "fuser"},
+		{"LAS_SCANNER_REMAIN", "LAS_SCANNER_LIFE_PERIOD", "Scanner Kit", "maintenance"},
+		{"LAS_PFKIT1_REMAIN", "LAS_PFKIT1_LIFE_PERIOD", "Paper Feed Kit (Tray 1)", "maintenance"},
+		{"LAS_PFKITMP_REMAIN", "LAS_PFKITMP_LIFE_PERIOD", "Paper Feed Kit (MP Tray)", "maintenance"},
+		{"LAS_PFKIT2_REMAIN", "LAS_PFKIT2_LIFE_PERIOD", "Paper Feed Kit (Tray 2)", "maintenance"},
+		{"LAS_PFKIT3_REMAIN", "LAS_PFKIT3_LIFE_PERIOD", "Paper Feed Kit (Tray 3)", "maintenance"},
+		{"LAS_PFKIT4_REMAIN", "LAS_PFKIT4_LIFE_PERIOD", "Paper Feed Kit (Tray 4)", "maintenance"},
+	}
+	for _, k := range kits {
+		rv, lv := get(k.remain), get(k.life)
+		if rv == "" || lv == "" {
+			continue
+		}
+		r, err1 := strconv.ParseInt(rv, 10, 64)
+		l, err2 := strconv.ParseInt(lv, 10, 64)
+		if err1 != nil || err2 != nil || l <= 0 {
+			continue
+		}
+		pct := int((r * 100) / l)
+		if pct > 100 {
+			pct = 100
+		}
+		if pct < 0 {
+			pct = 0
+		}
+		rawL := int(r)
+		rawM := int(l)
+		res.Supplies = append(res.Supplies, payload.Supply{
+			ID:           fmt.Sprintf("%s_.1.%d", k.typ, len(res.Supplies)+1),
+			Name:         k.name,
+			Description:  k.name,
+			Type:         k.typ,
+			Color:        "n/a",
+			Percentage:   payload.Float64Ptr(float64(pct)),
+			Status:       brSupplyStatus(pct),
+			IsMeasurable: true,
+			RawLevel:     &rawL,
+			RawMax:       &rawM,
+		})
+	}
+}
+
+func brSupplyStatus(pct int) string {
+	switch {
+	case pct <= 10:
+		return "Cr\u00edtico"
+	case pct <= 25:
+		return "Bajo"
+	default:
+		return "OK"
 	}
 }
 

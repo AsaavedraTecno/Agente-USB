@@ -173,22 +173,22 @@ func extractSupplies(g *gosnmp.GoSNMP) []payload.Supply {
 			levelPct = &pct
 		}
 
-		status := "ok"
+		status := "OK"
 		if levelPct != nil {
 			switch {
 			case *levelPct <= 10:
-				status = "critical"
+				status = "Cr\u00edtico"
 			case *levelPct <= 25:
-				status = "warning"
+				status = "Bajo"
 			}
 		}
 
 		supplies = append(supplies, payload.Supply{
-			Name:   desc,
-			Type:   "toner",
-			Color:  "black",
-			Level:  levelPct,
-			Status: status,
+			Name:       desc,
+			Type:       "toner",
+			Color:      "black",
+			Percentage: payload.Float64Ptr(float64(*levelPct)),
+			Status:     status,
 		})
 	}
 

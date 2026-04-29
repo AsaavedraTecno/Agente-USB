@@ -51,8 +51,15 @@ const (
 // Extract consulta Win32_Printer para el nombre de impresora dado.
 func Extract(printerName string) (*Result, error) {
 	script := fmt.Sprintf(`
-$p = Get-WmiObject Win32_Printer | Where-Object { $_.Name -eq '%s' }
+$pName = '%s'
+$p = Get-WmiObject Win32_Printer | Where-Object { $_.Name -eq $pName }
 if ($p -eq $null) { Write-Output 'null'; exit }
+
+$q = Get-WmiObject -Class Win32_PerfRawData_Spooler_PrintQueue -ErrorAction SilentlyContinue |
+     Where-Object { $_.Name -eq $pName -or $_.Name -like "$pName (*)" } |
+     Select-Object -First 1 -ExpandProperty TotalPagesPrinted
+$pages = if ($q) { [int64]$q } else { 0 }
+
 @{
   Name                       = [string]$p.Name
   Status                     = [string]$p.Status
@@ -60,6 +67,7 @@ if ($p -eq $null) { Write-Output 'null'; exit }
   PrinterState               = [int]$p.PrinterState
   DetectedErrorState         = [int]$p.DetectedErrorState
   ExtendedDetectedErrorState = [int]$p.ExtendedDetectedErrorState
+  PagesThisSession           = $pages
 } | ConvertTo-Json -Compress`, strings.ReplaceAll(printerName, "'", "''"))
 
 	out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", script).Output()
@@ -79,6 +87,7 @@ if ($p -eq $null) { Write-Output 'null'; exit }
 		PrinterState               uint32 `json:"PrinterState"`
 		DetectedErrorState         uint32 `json:"DetectedErrorState"`
 		ExtendedDetectedErrorState uint32 `json:"ExtendedDetectedErrorState"`
+		PagesThisSession           int64  `json:"PagesThisSession"`
 	}
 
 	if err := json.Unmarshal([]byte(raw), &wmiData); err != nil {
@@ -113,34 +122,10 @@ if ($p -eq $null) { Write-Output 'null'; exit }
 
 	res.Alerts = decodeAlerts(wmiData.ExtendedDetectedErrorState)
 
-	// Complementar con contador de páginas del spooler (desde último reinicio del servicio)
-	res.PagesThisSession = querySpoolerPageCount(wmiData.Name)
+	// Contador de páginas del spooler (desde último reinicio del servicio)
+	res.PagesThisSession = wmiData.PagesThisSession
 
 	return res, nil
-}
-
-// querySpoolerPageCount obtiene el TotalPagesPrinted del performance counter del spooler.
-// Este valor refleja páginas impresas desde el último inicio del servicio Print Spooler.
-// Usa coincidencia flexible porque el nombre del counter puede llevar sufijo de puerto:
-// "Samsung M332x 382x 402x Series (USB002)" aunque Win32_Printer.Name sea sin puerto.
-func querySpoolerPageCount(printerName string) int64 {
-	safe := strings.ReplaceAll(printerName, "'", "''")
-	// Buscar por nombre exacto primero; si no, buscar que el nombre empiece por ese string.
-	script := fmt.Sprintf(`
-$base = '%s'
-$q = Get-WmiObject -Class Win32_PerfRawData_Spooler_PrintQueue -ErrorAction SilentlyContinue |
-     Where-Object { $_.Name -eq $base -or $_.Name -like "$base (*)" } |
-     Select-Object -First 1 -ExpandProperty TotalPagesPrinted
-if ($q) { [string]$q } else { '0' }`, safe)
-
-	out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", script).Output()
-	if err != nil {
-		return 0
-	}
-	raw := strings.TrimSpace(string(out))
-	var n int64
-	fmt.Sscanf(raw, "%d", &n)
-	return n
 }
 
 // decodeAlerts convierte el campo ExtendedDetectedErrorState en alertas legibles.

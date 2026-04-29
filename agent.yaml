@@ -6,4 +6,5 @@ timeout_ms: 3000
 snmp_community: "public"
 retry_interval: 60
 manual_fallback: true
+bypass_spooler: true
 log_level: "info"

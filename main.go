@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"usb-agent/internal/bidi"
@@ -15,6 +16,7 @@ import (
 	"usb-agent/internal/payload"
 	"usb-agent/internal/pjl"
 	"usb-agent/internal/queue"
+	"usb-agent/internal/registryfallback"
 	"usb-agent/internal/snmpusb"
 	"usb-agent/internal/uploader"
 	"usb-agent/internal/wmiprinter"
@@ -36,6 +38,8 @@ func main() {
 	p := payload.New(cfg.AgentID, hostname, version)
 	startTime := time.Now()
 
+	extracted := false
+
 	// ── Paso 1: Detectar impresoras USB ────────────────────────────────────
 	fmt.Println("▶ [1/4] Detectando impresoras USB conectadas...")
 	printers := discovery.FindUSBPrinters()
@@ -56,7 +60,7 @@ func main() {
 	// ── Paso 2: Extracción con fallback ────────────────────────────────────
 	fmt.Println("▶ [2/4] Extrayendo datos...")
 
-	extracted := false
+
 
 	// Método 1: SNMP sobre IP virtual USB (solo si el driver crea adaptador de red)
 	fmt.Print("  Método 1 — SNMP sobre IP virtual USB ............. ")
@@ -78,7 +82,7 @@ func main() {
 	// Método 2: PJL directo via Win32 Spooler API
 	if !extracted {
 		fmt.Print("  Método 2 — PJL via Win32 Spooler API ............. ")
-		result, err := pjl.Extract(target.Name, target.PortName, cfg.TimeoutMs)
+		result, err := pjl.Extract(target.Name, target.PortName, cfg.TimeoutMs, cfg.BypassSpooler)
 		if err != nil {
 			fmt.Printf("✗\n             %v\n", err)
 		} else if result.Model == "" && result.PageCount == 0 && len(result.Supplies) == 0 && result.Status == "" {
@@ -119,6 +123,26 @@ func main() {
 		}
 	}
 
+	// Método 5: Registry Fallback (Solo si aún no tenemos niveles de suministros)
+	if len(p.Supplies) == 0 {
+		fmt.Print("  Método 5 — Status Monitor Registry Fallback ...... ")
+		regSupplies, regErr := registryfallback.Extract(target.Name)
+		if regErr == nil && len(regSupplies) > 0 {
+			p.Supplies = regSupplies
+			// Si solo teníamos WMI básico, subimos el confidence a wmi_registry_hybrid
+			if p.Source.Confidence == "wmi_basic" {
+				p.Source.Confidence = "wmi_registry_hybrid"
+			}
+			fmt.Printf("✓ (%d suministros)\n", len(regSupplies))
+		} else {
+			if regErr != nil {
+				fmt.Printf("✗ %v\n", regErr)
+			} else {
+				fmt.Println("✗ sin datos")
+			}
+		}
+	}
+
 	if !extracted {
 		fmt.Println("\n  ⚠  Todos los métodos fallaron. El payload estará vacío.")
 		p.Source.Confidence = "failed"
@@ -127,11 +151,38 @@ func main() {
 	// ── Paso 3: Finalizar payload ──────────────────────────────────────────
 	fmt.Println("\n▶ [3/4] Construyendo payload...")
 
-	endTime := time.Now()
-	p.Metrics.PollCompletedAt = endTime.UTC().Format(time.RFC3339)
-	p.Metrics.PollDurationMs = endTime.Sub(startTime).Milliseconds()
+	p.Metrics.Polling.LastPollAt = time.Now().UTC().Format(time.RFC3339)
+	p.CollectedAt = p.Metrics.Polling.LastPollAt
+	p.Metrics.Polling.PollDurationMs = time.Since(startTime).Milliseconds()
+	// success_rate can be calculated based on whether any extracted data exists
 	if extracted {
-		p.Metrics.SuccessRate = 1.0
+		p.Metrics.Polling.OidSuccessRate = 1.0
+	} else {
+		p.Metrics.Polling.OidSuccessRate = 0.0
+	}
+	if p.Printer.SerialNumber != "" {
+		p.Printer.ID = p.Printer.SerialNumber
+	} else if p.Printer.MACAddress != nil && *p.Printer.MACAddress != "" {
+		p.Printer.ID = *p.Printer.MACAddress
+	} else {
+		p.Printer.ID = "UNKNOWN"
+	}
+
+	p.EventID = fmt.Sprintf("%s::%s::%d", p.Source.AgentID, p.Printer.ID, time.Now().Unix())
+
+	// Counters: derive simplex = total - duplex
+	p.Counters.Confidence = p.Source.Confidence
+	if p.Counters.Absolute.Total != nil && p.Counters.LogicalMatrix.ByMode.Duplex != nil {
+		simplex := *p.Counters.Absolute.Total - *p.Counters.LogicalMatrix.ByMode.Duplex
+		p.Counters.LogicalMatrix.ByMode.Simplex = payload.Int64Ptr(simplex)
+		// Also correct mono = total (this is a mono-only printer, color is always 0)
+		p.Counters.Absolute.Mono = p.Counters.Absolute.Total
+		p.Counters.Absolute.Color = payload.Int64Ptr(0)
+	}
+
+	// Printer hostname: usar el de la impresora (derivado de MAC), fallback a PC hostname
+	if p.Printer.Hostname == "" {
+		p.Printer.Hostname = p.Source.Hostname + "_usb_host"
 	}
 
 	jsonBytes, err := json.MarshalIndent(p, "", "  ")
@@ -170,39 +221,107 @@ func main() {
 func applySnmpResult(p *payload.Payload, r *snmpusb.Result, ip string) {
 	p.Printer.Brand = r.Brand
 	p.Printer.Model = r.Model
-	p.Printer.Serial = r.Serial
+	p.Printer.SerialNumber = r.Serial
 	p.Printer.IP = payload.StrPtr(ip)
 	if r.MAC != "" {
-		p.Printer.MAC = payload.StrPtr(r.MAC)
+		p.Printer.MACAddress = payload.StrPtr(r.MAC)
 	}
 	if r.TotalPages > 0 {
-		p.Counters.TotalPages = payload.Int64Ptr(r.TotalPages)
+		p.Counters.Absolute.Total = payload.Int64Ptr(r.TotalPages)
 	}
 	p.Supplies = r.Supplies
-	p.DeviceAlerts = r.Alerts
+	// Map Alerts to string
+	for _, a := range r.Alerts {
+		p.DeviceAlerts = append(p.DeviceAlerts, a.Message)
+	}
 }
 
 func applyPJLResult(p *payload.Payload, r *pjl.Result) {
 	p.Printer.Brand = r.Brand
 	p.Printer.Model = r.Model
-	p.Printer.Serial = r.Serial
+	p.Printer.SerialNumber = r.Serial
+	// La impresora reporta su marca directamente vía PJL → confianza total
+	p.Printer.BrandConfidence = 1.0
+	if r.PrinterHostname != "" {
+		p.Printer.Hostname = r.PrinterHostname
+	}
 	if len(r.Trays) > 0 {
 		p.Printer.Trays = r.Trays
 	}
 	if r.PageCount > 0 {
-		p.Counters.TotalPages = payload.Int64Ptr(r.PageCount)
+		p.Counters.Absolute.Total = payload.Int64Ptr(r.PageCount)
+		p.Counters.Absolute.Mono = payload.Int64Ptr(r.PageCount)
+	}
+	if r.PrintPages > 0 {
+		p.Counters.LogicalMatrix.ByFunction.Print = payload.Int64Ptr(r.PrintPages)
+	}
+	if r.CopyPages > 0 {
+		p.Counters.LogicalMatrix.ByFunction.Copy = payload.Int64Ptr(r.CopyPages)
+	}
+	// Duplex: usar DuplexSet para saber si el dato fue recibido (puede ser 0)
+	if r.DuplexSet {
+		p.Counters.LogicalMatrix.ByMode.Duplex = payload.Int64Ptr(r.DuplexPages)
+	} else if r.DuplexPages > 0 {
+		p.Counters.LogicalMatrix.ByMode.Duplex = payload.Int64Ptr(r.DuplexPages)
+	}
+	if r.ScanPages > 0 {
+		p.Counters.HardwareUsage.TotalScans = payload.Int64Ptr(r.ScanPages)
+	}
+	if r.CoverageLast > 0 {
+		p.Counters.CoverageLast = payload.Float64Ptr(r.CoverageLast)
+	}
+	if r.MAC != "" && p.Printer.MACAddress == nil {
+		p.Printer.MACAddress = payload.StrPtr(r.MAC)
+	}
+	if r.IP != "" && p.Printer.IP == nil {
+		p.Printer.IP = payload.StrPtr(r.IP)
+	}
+	if r.Online {
+		p.Printer.Status = "online"
+	} else if r.Status != "" {
+		p.Printer.Status = strings.ToLower(r.Status)
+	}
+	if r.Firmware != "" && p.Printer.Firmware == nil {
+		p.Printer.Firmware = payload.StrPtr(r.Firmware)
+	}
+	if r.UptimeMinutes > 0 {
+		uptimeSec := r.UptimeMinutes * 60
+		p.Metrics.UptimeSeconds = payload.Int64Ptr(uptimeSec)
+	}
+	if r.PowerOnCount > 0 {
+		p.Metrics.PowerOnCount = payload.Int64Ptr(r.PowerOnCount)
+	}
+	if r.EngineCycles > 0 {
+		p.Counters.HardwareUsage.EngineCycles = payload.Int64Ptr(r.EngineCycles)
+	}
+	// Métricas Brother propietarias: se escriben siempre (incluso como 0)
+	// cuando se recibió BRSUPPLY — mismo patrón que los jam counters.
+	if r.Confidence == "pjl_brother_custom" {
+		p.Metrics.UptimeSeconds = payload.Int64Ptr(r.UptimeMinutes * 60)
+		p.Metrics.PowerOnCount  = payload.Int64Ptr(r.PowerOnCount)
+		p.Counters.HardwareUsage.JamTotal  = payload.Int64Ptr(r.JamTotal)
+		p.Counters.HardwareUsage.JamTray1  = payload.Int64Ptr(r.JamTray1)
+		p.Counters.HardwareUsage.JamTray2  = payload.Int64Ptr(r.JamTray2)
+		p.Counters.HardwareUsage.JamTrayMP = payload.Int64Ptr(r.JamTrayMP)
+		p.Counters.HardwareUsage.JamInside = payload.Int64Ptr(r.JamInside)
+		p.Counters.HardwareUsage.JamRear   = payload.Int64Ptr(r.JamRear)
+	}
+	if r.CoverageAvg > 0 {
+		p.Counters.CoverageAvg = payload.Float64Ptr(r.CoverageAvg)
 	}
 	p.Supplies = r.Supplies
-	p.DeviceAlerts = r.Alerts
+	for _, a := range r.Alerts {
+		p.DeviceAlerts = append(p.DeviceAlerts, a.Message)
+	}
 	p.Source.Confidence = r.Confidence
 }
 
 func applyBidiResult(p *payload.Payload, r *bidi.Result) {
-	if (p.Printer.Serial == "" || p.Printer.Serial == "?") && r.Serial != "" {
-		p.Printer.Serial = r.Serial
+	if (p.Printer.SerialNumber == "" || p.Printer.SerialNumber == "?") && r.Serial != "" {
+		p.Printer.SerialNumber = r.Serial
 	}
-	if p.Counters.TotalPages == nil && r.PageCount > 0 {
-		p.Counters.TotalPages = payload.Int64Ptr(r.PageCount)
+	if p.Counters.Absolute.Total == nil && r.PageCount > 0 {
+		p.Counters.Absolute.Total = payload.Int64Ptr(r.PageCount)
 	}
 	if len(r.Supplies) > 0 {
 		p.Supplies = r.Supplies
@@ -217,17 +336,17 @@ func applyWMIResult(p *payload.Payload, r *wmiprinter.Result, primary bool) {
 		p.Printer.Brand = r.Brand
 		p.Printer.Model = r.Name
 	}
-	// Si el serial está vacío o tiene el signo '?' residual de Samsung, usar el de WMI
-	if (p.Printer.Serial == "" || p.Printer.Serial == "?") && r.Serial != "" {
-		p.Printer.Serial = r.Serial
+	if (p.Printer.SerialNumber == "" || p.Printer.SerialNumber == "?") && r.Serial != "" {
+		p.Printer.SerialNumber = r.Serial
 	}
-	// Si no hay contador de páginas de PJL/SNMP, usar el del spooler (desde último reinicio)
-	if p.Counters.TotalPages == nil && r.PagesThisSession > 0 {
-		p.Counters.TotalPages = payload.Int64Ptr(r.PagesThisSession)
+	if p.Counters.Absolute.Total == nil && r.PagesThisSession > 50 {
+		p.Counters.Absolute.Total = payload.Int64Ptr(r.PagesThisSession)
 	}
-	// Siempre agregar alertas WMI que no estén ya reportadas
 	for _, a := range r.Alerts {
-		p.DeviceAlerts = append(p.DeviceAlerts, a)
+		p.DeviceAlerts = append(p.DeviceAlerts, a.Message)
+	}
+	if p.Printer.Status == "" && r.Status != "" && r.Status != "Unknown" {
+		p.Printer.Status = strings.ToLower(r.Status)
 	}
 }
 
