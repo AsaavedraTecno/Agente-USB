@@ -17,7 +17,10 @@ type Payload struct {
 
 type Source struct {
 	AgentID          string `json:"agent_id"`
-	ClientName       string `json:"client_name,omitempty"`
+	// Nota libre del técnico (campo "Nota" de la GUI) — el backend la guarda
+	// bajo la clave "label" (DeviceIdentityProcessor::updateAgentStatus()),
+	// no "client_name". Va como Label acá para no arrastrar el nombre viejo.
+	Label            string `json:"label,omitempty"`
 	Hostname         string `json:"hostname"`
 	OS               string `json:"os"`
 	Version          string `json:"version"`
