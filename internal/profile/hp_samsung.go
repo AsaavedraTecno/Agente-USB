@@ -264,8 +264,42 @@ func (h *HPSamsungProfile) Extract(printer discovery.USBPrinter, cfg *config.Con
 		RawMax:       payload.IntPtr(drumMax),
 	})
 
+	// El protocolo binario Samsung no tiene un comando para "páginas impresas
+	// con ESTE cartucho" (solo el total de vida de la impresora, ya leído
+	// arriba) -- ese dato solo lo expone el Embedded Web Server de HP. Sin
+	// esto, pages_with_supply queda NULL para siempre en cualquier impresora
+	// donde el protocolo binario responde bien (el camino normal), y
+	// "Uso/Ciclo Total" en el panel se ve vacío pese a que el agente sí tiene
+	// forma de conseguir el dato -- solo que no por esta vía. Best-effort:
+	// si EWS no responde, se ignora, ya tenemos todo lo demás del binario.
+	enrichPagesWithSupplyViaEWS(targetPath, p, lg)
+
 	lg.Logf("  ✓ Perfil %s ejecutado correctamente", h.Name())
 	return true, nil
+}
+
+// enrichPagesWithSupplyViaEWS completa PagesWithSupply en los tóners ya
+// extraídos por el protocolo binario, consultando el EWS solo por ese dato
+// puntual. Timeout corto (2s): es un complemento, no puede volver lenta la
+// extracción normal si el EWS no responde rápido.
+func enrichPagesWithSupplyViaEWS(targetPath string, p *payload.Payload, lg Logger) {
+	status, err := hpprotocol.FetchEWSStatus(targetPath, 2000)
+	if err != nil {
+		lg.Logf("  [i] No se pudo completar páginas-por-cartucho vía EWS (%v) — Uso/Ciclo Total quedará vacío para esta lectura", err)
+		return
+	}
+
+	for i := range p.Supplies {
+		if p.Supplies[i].Type != "toner" || p.Supplies[i].Color == "" {
+			continue
+		}
+		for _, s := range status.Supplies {
+			if s.PagesPrinted > 0 && strings.Contains(strings.ToLower(s.Name), p.Supplies[i].Color) {
+				p.Supplies[i].PagesWithSupply = payload.IntPtr(s.PagesPrinted)
+				break
+			}
+		}
+	}
 }
 
 // extractViaEWS es el respaldo para modelos HP más nuevos (herencia Samsung pero firmware

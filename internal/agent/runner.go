@@ -39,7 +39,7 @@ func Run(cfg *config.Config, logFn func(string)) error {
 
 	hostname, _ := os.Hostname()
 	p := payload.New(cfg.AgentID, hostname, Version)
-	p.Source.ClientName = cfg.ClientName
+	p.Source.Label = cfg.ClientName
 	startTime := time.Now()
 	extracted := false
 
@@ -243,6 +243,18 @@ func Run(cfg *config.Config, logFn func(string)) error {
 		p.Printer.Hostname = p.Source.Hostname + "_usb_host"
 	}
 
+	// Cada perfil (hp_samsung.go, epson.go, WMI, SNMP-sobre-USB) escribe
+	// p.Printer.Status con su propio vocabulario -- HP manda "normal"/
+	// "critical", WMI manda el string crudo de Windows ("Idle", "Paper
+	// Jam"...). El backend solo reconoce online/offline/warning/error
+	// (columna printers.online_status, mapeada 1:1 desde este campo en
+	// ProcessTelemetryJob.php); cualquier otro valor cae en "Desconocido"
+	// en el panel aunque la impresora esté perfectamente online. Un solo
+	// punto de normalización acá, no un fix por perfil -- AgenteSNMP ya
+	// resuelve el mismo problema así (ver extractPrinterStatus en
+	// pkg/telemetry/builder.go).
+	p.Printer.Status = normalizeStatus(p.Printer.Status)
+
 	// Delta de estado
 	printerIDClean := strings.ReplaceAll(p.Printer.ID, ":", "")
 	stateDir := cfg.ResolveDir(cfg.StateDir)
@@ -296,6 +308,42 @@ func Run(cfg *config.Config, logFn func(string)) error {
 	logFn("__STATUS__:success")
 
 	return nil
+}
+
+// normalizeStatus traduce el vocabulario de estado de cualquier perfil (HP
+// EWS: normal/warning/critical; WMI: el string crudo de Windows, ej. "Idle",
+// "Paper Jam"; SNMP-sobre-USB: ya viene normalizado) al mismo vocabulario de
+// conectividad que espera el backend: online/offline/warning/error/unknown.
+// Un desconocido no es "unknown" de mentira -- si no matchea nada, es mejor
+// no inventar online, así que también cae en unknown.
+func normalizeStatus(raw string) string {
+	s := strings.ToLower(strings.TrimSpace(raw))
+
+	switch s {
+	case "":
+		return "unknown"
+	case "online", "normal", "idle", "printing", "ready", "ok", "processing":
+		return "online"
+	case "offline":
+		return "offline"
+	case "warning":
+		return "warning"
+	case "error", "critical":
+		return "error"
+	}
+
+	switch {
+	case strings.Contains(s, "jam"), strings.Contains(s, "critical"), strings.Contains(s, "no toner"), strings.Contains(s, "door open"):
+		return "error"
+	case strings.Contains(s, "offline"), strings.Contains(s, "disconnect"):
+		return "offline"
+	case strings.Contains(s, "error"):
+		return "error"
+	case strings.Contains(s, "warn"), strings.Contains(s, "warm"), strings.Contains(s, "low"):
+		return "warning"
+	}
+
+	return "unknown"
 }
 
 // ── Aplicadores de resultado ──────────────────────────────────────────────────
