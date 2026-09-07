@@ -1,2 +1,34 @@
 /queue
-/.claude/       
+/.claude/
+/.agents/
+
+# agent.yaml local siempre trae credenciales reales (api_key, agent_id) del
+# servidor contra el que se está probando -- no hay versión "segura" que
+# tenga sentido commitear. Ver notas/ para la plantilla de referencia.
+/agent.yaml
+
+# Identidad de esta máquina (UUID v4) -- no es config del proyecto, es un
+# secreto por-instalación.
+/machine_id
+
+# Binarios de build, nunca fuente.
+*.exe
+*.exe~
+
+# Runtime: logs, caché de estado por impresora, dumps de debug manuales.
+/agent.log
+/test.log
+/state/
+/hp_telemetry.json
+/hp_xml_telemetry.json
+/raw_dump_*.xml
+
+# Herramienta de terceros vendorizada para pruebas manuales (PRET), con su
+# propio repo git adentro -- no es parte de este proyecto.
+/pret_temp/
+
+# Config de Claude Code, no del proyecto.
+skills-lock.json
+
+# Archivo vacío accidental, sin nombre significativo.
+/4000

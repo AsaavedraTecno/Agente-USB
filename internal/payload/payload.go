@@ -11,12 +11,13 @@ type Payload struct {
 	Printer       Printer  `json:"printer"`
 	Counters      Counters `json:"counters"`
 	Supplies      []Supply `json:"supplies"`
-	DeviceAlerts  []string `json:"device_alerts"`
+	Alerts        []Alert  `json:"alerts"`
 	Metrics       Metrics  `json:"metrics"`
 }
 
 type Source struct {
 	AgentID          string `json:"agent_id"`
+	ClientName       string `json:"client_name,omitempty"`
 	Hostname         string `json:"hostname"`
 	OS               string `json:"os"`
 	Version          string `json:"version"`
@@ -26,18 +27,23 @@ type Source struct {
 }
 
 type Printer struct {
-	ID              string  `json:"id"`
-	IP              *string `json:"ip"`
-	Brand           string  `json:"brand"`
-	BrandConfidence float64 `json:"brand_confidence"`
-	Model           string  `json:"model"`
-	SerialNumber    string  `json:"serial_number"`
-	Hostname        string  `json:"hostname"`
-	MACAddress      *string `json:"mac_address"`
-	Location        *string `json:"location"`
-	Firmware        *string `json:"firmware,omitempty"`
-	Status          string  `json:"status,omitempty"`
-	Trays           []Tray  `json:"trays"`
+	ID                   string  `json:"id"`
+	IP                   *string `json:"ip"`
+	Brand                string  `json:"brand"`
+	BrandConfidence      float64 `json:"brand_confidence"`
+	Model                string  `json:"model"`
+	SerialNumber         string  `json:"serial_number"`
+	Hostname             string  `json:"hostname"`
+	MACAddress           *string `json:"mac_address"`
+	Location             *string `json:"location"`
+	AssetNumber          *string `json:"asset_number,omitempty"`
+	CompanyName          *string `json:"company_name,omitempty"`
+	ContactPerson        *string `json:"contact_person,omitempty"`
+	Firmware             *string `json:"firmware,omitempty"`
+	Status               string  `json:"status,omitempty"`
+	Display              *string `json:"display,omitempty"`
+	DuplexCountingMethod *string `json:"duplex_counting_method,omitempty"`
+	Trays                []Tray  `json:"trays"`
 }
 
 type Tray struct {
@@ -53,15 +59,33 @@ type Counters struct {
 	Absolute      CountersAbsolute      `json:"absolute"`
 	LogicalMatrix CountersLogicalMatrix `json:"logical_matrix"`
 	HardwareUsage CountersHardwareUsage `json:"hardware_usage"`
+	Delta         *CountersDelta        `json:"delta"`
+	ResetDetected *bool                 `json:"reset_detected,omitempty"`
 	Confidence    string                `json:"confidence"`
 	CoverageLast  *float64              `json:"coverage_last"`
 	CoverageAvg   *float64              `json:"coverage_avg"`
 }
 
+type CountersDelta struct {
+	TotalPages        *int64 `json:"total_pages"`
+	MonoPages         *int64 `json:"mono_pages"`
+	ColorPages        *int64 `json:"color_pages"`
+	ScanPages         *int64 `json:"scan_pages"`
+	CopyPages         *int64 `json:"copy_pages"`
+	FaxPages          *int64 `json:"fax_pages"`
+	SimplexPages      *int64 `json:"simplex_pages"`
+	EngineCycles      *int64 `json:"engine_cycles"`
+	EngineCyclesMono  *int64 `json:"engine_cycles_mono"`
+	EngineCyclesColor *int64 `json:"engine_cycles_color"`
+}
+
 type CountersAbsolute struct {
-	Total *int64 `json:"total"`
-	Mono  *int64 `json:"mono"`
-	Color *int64 `json:"color"`
+	Total           *int64 `json:"total"`
+	Mono            *int64 `json:"mono"`
+	Color           *int64 `json:"color"`
+	EquivalentTotal *int64 `json:"equivalent_total,omitempty"`
+	EquivalentMono  *int64 `json:"equivalent_mono,omitempty"`
+	EquivalentColor *int64 `json:"equivalent_color,omitempty"`
 }
 
 type CountersLogicalMatrix struct {
@@ -71,15 +95,23 @@ type CountersLogicalMatrix struct {
 }
 
 type CountersByFunction struct {
-	Print    *int64 `json:"print"`
-	Copy     *int64 `json:"copy"`
-	FaxPrint *int64 `json:"fax_print"`
-	Reports  *int64 `json:"reports"`
+	Print      *int64 `json:"print"`
+	PrintMono  *int64 `json:"print_mono,omitempty"`
+	PrintColor *int64 `json:"print_color,omitempty"`
+	Copy       *int64 `json:"copy"`
+	CopyMono   *int64 `json:"copy_mono,omitempty"`
+	CopyColor  *int64 `json:"copy_color,omitempty"`
+	FaxPrint   *int64 `json:"fax_print"`
+	Reports    *int64 `json:"reports"`
 }
 
 type CountersByMode struct {
-	Simplex *int64 `json:"simplex"`
-	Duplex  *int64 `json:"duplex"`
+	Simplex           *int64 `json:"simplex"`
+	Duplex            *int64 `json:"duplex,omitempty"`
+	DuplexSheets      *int64 `json:"duplex_sheets,omitempty"`
+	DuplexMono        *int64 `json:"duplex_mono,omitempty"`
+	DuplexColor       *int64 `json:"duplex_color,omitempty"`
+	DuplexImpressions *int64 `json:"duplex_impressions,omitempty"`
 }
 
 type CountersByDestination struct {
@@ -92,37 +124,49 @@ type CountersByDestination struct {
 }
 
 type CountersHardwareUsage struct {
-	TotalScans   *int64 `json:"total_scans"`
-	EngineCycles *int64 `json:"engine_cycles"`
-	JamTotal     *int64 `json:"jam_total"`
-	JamTray1     *int64 `json:"jam_tray1"`
-	JamTray2     *int64 `json:"jam_tray2"`
-	JamTrayMP    *int64 `json:"jam_tray_mp"`
-	JamInside    *int64 `json:"jam_inside"`
-	JamRear      *int64 `json:"jam_rear"`
+	TotalScans        *int64 `json:"total_scans"`
+	EngineCycles      *int64 `json:"engine_cycles"`
+	EngineCyclesMono  *int64 `json:"engine_cycles_mono,omitempty"`
+	EngineCyclesColor *int64 `json:"engine_cycles_color,omitempty"`
+	JamTotal          *int64 `json:"jam_total,omitempty"`
+	JamTray1          *int64 `json:"jam_tray1,omitempty"`
+	JamTray2          *int64 `json:"jam_tray2,omitempty"`
+	JamTrayMP         *int64 `json:"jam_tray_mp,omitempty"`
+	JamInside         *int64 `json:"jam_inside,omitempty"`
+	JamRear           *int64 `json:"jam_rear,omitempty"`
 }
 
 type Supply struct {
-	ID            string   `json:"id"`
-	Type          string   `json:"type"`
-	Color         string   `json:"color"`
-	Name          string   `json:"name"`
-	Description   string   `json:"description"`
-	Percentage    *float64 `json:"percentage"`
-	Status        string   `json:"status"`
-	IsMeasurable  bool     `json:"is_measurable"`
-	RawLevel      *int     `json:"raw_level"`
-	RawMax        *int     `json:"raw_max"`
-	SerialNumber  *string  `json:"serial_number,omitempty"`
-	CartridgeType *string  `json:"cartridge_type,omitempty"`
-	ChangeCount   *int     `json:"change_count,omitempty"`
-	Genuine       *bool    `json:"genuine,omitempty"`
+	ID              string   `json:"id"`
+	Type            string   `json:"type"`
+	SubType         string   `json:"sub_type,omitempty"`
+	Color           string   `json:"color"`
+	Category        string   `json:"category,omitempty"`
+	IsWaste         *bool    `json:"is_waste,omitempty"`
+	Name            string   `json:"name"`
+	Description     string   `json:"description"`
+	SerialNumber    *string  `json:"serial_number,omitempty"`
+	Model           *string  `json:"model,omitempty"`
+	IsOriginal      *bool    `json:"is_original,omitempty"`
+	Percentage      *float64 `json:"percentage"`
+	Status          string   `json:"status"`
+	IsMeasurable    bool     `json:"is_measurable"`
+	SnmpTypeID      *int     `json:"snmp_type_id,omitempty"`
+	RawLevel        *int     `json:"raw_level"`
+	RawMax          *int     `json:"raw_max"`
+	PagesWithSupply *int     `json:"pages_with_supply,omitempty"`
+	InstallDate     *string  `json:"install_date,omitempty"`
+	CartridgeType   *string  `json:"cartridge_type,omitempty"`
+	ChangeCount     *int     `json:"change_count,omitempty"`
+	Genuine         *bool    `json:"genuine,omitempty"`
 }
 
 type Alert struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
-	Level   string `json:"level"`
+	ID         string `json:"id"`
+	Type       string `json:"type"`
+	Severity   string `json:"severity"`
+	Message    string `json:"message"`
+	DetectedAt string `json:"detected_at"`
 }
 
 type Metrics struct {
@@ -137,7 +181,7 @@ type MetricsPolling struct {
 	OidSuccessRate float64 `json:"oid_success_rate"`
 	RetryCount     int     `json:"retry_count"`
 	LastPollAt     string  `json:"last_poll_at"`
-	NextPollAt     string  `json:"next_poll_at"`
+	NextPollAt     *string `json:"next_poll_at"`
 	ErrorCount     int     `json:"error_count"`
 }
 
@@ -155,10 +199,10 @@ func New(agentID, hostname, version string) *Payload {
 			CollectionMethod: "usb_direct",
 			ConnectedVia:     "usb",
 		},
-		Printer:      Printer{Trays: []Tray{}},
-		Counters:     Counters{},
-		Supplies:     []Supply{},
-		DeviceAlerts: []string{},
+		Printer:  Printer{Trays: []Tray{}},
+		Counters: Counters{},
+		Supplies: []Supply{},
+		Alerts:   []Alert{},
 		Metrics: Metrics{
 			Polling: MetricsPolling{LastPollAt: now},
 		},

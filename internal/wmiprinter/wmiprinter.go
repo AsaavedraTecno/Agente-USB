@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"syscall"
+	"time"
 
 	"usb-agent/internal/payload"
 )
@@ -70,7 +72,9 @@ $pages = if ($q) { [int64]$q } else { 0 }
   PagesThisSession           = $pages
 } | ConvertTo-Json -Compress`, strings.ReplaceAll(printerName, "'", "''"))
 
-	out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", script).Output()
+	psCmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", script)
+	psCmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	out, err := psCmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("WMI query: %w", err)
 	}
@@ -99,7 +103,7 @@ $pages = if ($q) { [int64]$q } else { 0 }
 		Brand:                      inferBrand(wmiData.Name),
 		Status:                     wmiData.Status,
 		PrinterState:               wmiData.PrinterState,
-		DetectedErrorState:        wmiData.DetectedErrorState,
+		DetectedErrorState:         wmiData.DetectedErrorState,
 		ExtendedDetectedErrorState: wmiData.ExtendedDetectedErrorState,
 	}
 
@@ -136,26 +140,28 @@ func decodeAlerts(state uint32) []payload.Alert {
 		msg   string
 		level string
 	}{
-		edesLowPaper:       {"Papel bajo", "warning"},
-		edesNoPaper:        {"Sin papel", "critical"},
-		edesLowToner:       {"Tóner bajo", "warning"},
-		edesNoToner:        {"Sin tóner", "critical"},
-		edesOutOfMemory:    {"Memoria insuficiente", "warning"},
-		edesDoorOpen:       {"Puerta abierta", "critical"},
-		edesJammed:         {"Atasco de papel", "critical"},
-		edesOffline:        {"Impresora offline", "warning"},
-		edesServiceReq:     {"Requiere servicio", "critical"},
-		edesOutputBinFull:  {"Bandeja de salida llena", "warning"},
-		edesPaperProblem:   {"Problema de papel", "warning"},
+		edesLowPaper:        {"Papel bajo", "warning"},
+		edesNoPaper:         {"Sin papel", "critical"},
+		edesLowToner:        {"Tóner bajo", "warning"},
+		edesNoToner:         {"Sin tóner", "critical"},
+		edesOutOfMemory:     {"Memoria insuficiente", "warning"},
+		edesDoorOpen:        {"Puerta abierta", "critical"},
+		edesJammed:          {"Atasco de papel", "critical"},
+		edesOffline:         {"Impresora offline", "warning"},
+		edesServiceReq:      {"Requiere servicio", "critical"},
+		edesOutputBinFull:   {"Bandeja de salida llena", "warning"},
+		edesPaperProblem:    {"Problema de papel", "warning"},
 		edesCannotPrintPage: {"No puede imprimir página", "critical"},
-		edesUserInterv:     {"Requiere intervención del usuario", "warning"},
+		edesUserInterv:      {"Requiere intervención del usuario", "warning"},
 	}
 
 	if entry, ok := messages[state]; ok {
 		alerts = append(alerts, payload.Alert{
-			Code:    fmt.Sprintf("WMI_%d", state),
-			Message: entry.msg,
-			Level:   entry.level,
+			ID:         fmt.Sprintf("WMI_%d", state),
+			Type:       "device",
+			Severity:   entry.level,
+			Message:    entry.msg,
+			DetectedAt: time.Now().UTC().Format(time.RFC3339),
 		})
 	}
 

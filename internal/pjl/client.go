@@ -53,11 +53,20 @@ type Result struct {
 	PrinterHostname string // BRW/BRN + PCBM_SN (derivado)
 	NetworkConn     string // LAS_NETWORK_CONNECTION: WLAN/LAN
 	Status          string
+	Display         string
 	Online          bool
 	PageCount       int64
 	PrintPages      int64
+	PrintMono       int64
+	PrintColor      int64
 	CopyPages       int64
+	CopyMono        int64
+	CopyColor       int64
+	ReportsPages    int64
+	MonoPages       int64
+	ColorPages      int64
 	DuplexPages     int64
+	DuplexSheets    int64
 	DuplexSet       bool // true cuando LAS_PAGECOUNT_TOTAL_DX fue recibido (incluso si es 0)
 	ScanPages       int64
 	CoverageLast    float64
@@ -93,17 +102,17 @@ type Result struct {
 //  2. USB raw con spooler activo (timeout normal) — fallback o si bypass falla/no admin
 //  3. Job RAW via spooler + ReadPrinter — último recurso
 func Extract(printerName, portName string, timeoutMs int, bypassSpooler bool) (*Result, error) {
-	pjlCmd := buildPJLQuery()
+	// Intentamos detectar el perfil por el nombre de la impresora primero como hint
+	profileHint := DetectProfile(printerName)
 
 	// Intento 1: detener spooler PRIMERO para acceso exclusivo al bulk-IN USB.
-	// Sin spooler activo, la respuesta BRSUPPLY llega sin competencia.
 	if bypassSpooler {
 		log.Printf("[PJL-Raw] Deteniendo Spooler para acceso exclusivo al USB...")
 		if stopErr := spooler.Stop(); stopErr == nil {
 			log.Printf("[PJL-Raw] Spooler detenido. Esperando que libere el puerto...")
 			time.Sleep(2 * time.Second) // dar tiempo a que se cierren los handles
 
-			res, usbErr := tryUSBRaw(pjlCmd, 30000) // ventana de 30s para capturar BRSUPPLY
+			res, usbErr := tryUSBRaw(timeoutMs)
 
 			log.Printf("[PJL-Raw] Restaurando Spooler...")
 			spooler.Start()
@@ -118,12 +127,13 @@ func Extract(printerName, portName string, timeoutMs int, bypassSpooler bool) (*
 	}
 
 	// Intento 2: USB raw con spooler activo (datos parciales posibles por competencia)
-	if res, err := tryUSBRaw(pjlCmd, timeoutMs); err == nil {
+	if res, err := tryUSBRaw(timeoutMs); err == nil {
 		return res, nil
 	}
 
 	// Intento 3: job RAW via spooler + ReadPrinter (último recurso)
-	return extractViaSpool(printerName, timeoutMs)
+	// Para el spooler evitamos hacer 2 jobs separados, usamos el profileHint
+	return extractViaSpool(printerName, timeoutMs, profileHint)
 }
 
 // tryUSBRaw enumera USB printer device paths via SetupDi y envía PJL directamente.
@@ -134,56 +144,90 @@ func Extract(printerName, portName string, timeoutMs int, bypassSpooler bool) (*
 //     de que la ventana de lectura se cierra y queda en el buffer hasta la siguiente ejecución.
 //     Esos bytes drenados son una respuesta PJL válida del ciclo anterior y se usan como
 //     fallback cuando la lectura fresca no obtiene datos a tiempo.
-func tryUSBRaw(pjlCmd string, timeoutMs int) (*Result, error) {
+func tryUSBRaw(timeoutMs int) (*Result, error) {
 	paths, err := usbraw.FindDevicePaths()
 	if err != nil || len(paths) == 0 {
 		return nil, fmt.Errorf("no se encontraron device paths USB: %v", err)
 	}
 
 	for _, path := range paths {
+		// Paso 1: Detectar modelo con comando básico
+		idCmd := uel + "@PJL\r\n@PJL INFO ID\r\n" + uel
+		isIDComplete := func(data []byte, isIdle bool) bool {
+			return parsePJL(data, &GenericProfile{}).Model != ""
+		}
+
+		freshID, _, err := usbraw.SendPJLAndRead(path, idCmd, 2000, isIDComplete)
+		if err != nil {
+			log.Printf("[PJL-Raw] %s fallo en INFO ID: %v", path, err)
+			continue
+		}
+
+		model := parsePJL(freshID, &GenericProfile{}).Model
+		if model == "" {
+			continue // No respondió modelo
+		}
+
+		profile := DetectProfile(model)
+		pjlCmd := profile.BuildPJLCommands()
+
+		cmdTimeout := timeoutMs
+		if profile.Name() == "HP Samsung-Heritage" {
+			cmdTimeout = 8000 // timeout de 8 segundos para PML sobre USB
+		}
+
+		// Paso 2: Extraer datos con el perfil correcto
 		isComplete := func(data []byte, isIdle bool) bool {
 			if !isIdle {
 				return false
 			}
-			res := parsePJL(data)
+			res := parsePJL(data, profile)
 			if res.Model == "" {
 				return false
 			}
 
 			// Esperar siempre hasta que el bloque VARIABLES termine (marcado con \x0c).
-			// Como es el último comando que enviamos, si vemos \x0c después de él,
-			// la impresora ha respondido a todo.
-			idx := bytes.Index(data, []byte("@PJL INFO VARIABLES"))
-			if idx != -1 {
-				// Buscar \x0c después de la cabecera
-				if bytes.IndexByte(data[idx:], '\x0c') != -1 {
-					return len(res.Supplies) > 0 || res.PageCount > 0
+			if profile.Name() == "HP Samsung-Heritage" {
+				// Como eliminamos VARIABLES, para HP Samsung-Heritage esperamos que lleguen
+				// algunas respuestas PML ASCIIHEX, o dejamos que se cumpla el timeout corto (8s)
+				if bytes.Contains(data, []byte("@PJL DMCMD ASCIIHEX=")) {
+					// Extraemos heurísticamente para ver si ya tenemos el serial o los supplies
+					tempRes := parsePJL(data, profile)
+					if tempRes.Serial != "" || tempRes.PageCount > 0 || len(tempRes.Supplies) > 0 {
+						return true
+					}
+				}
+			} else {
+				idx := bytes.Index(data, []byte("@PJL INFO VARIABLES"))
+				if idx != -1 {
+					if bytes.IndexByte(data[idx:], '\x0c') != -1 {
+						if profile.ShouldParseSupplies() || profile.ShouldParseCounters() {
+							return len(res.Supplies) > 0 || res.PageCount > 0
+						}
+						return true
+					}
 				}
 			}
 
-			// Si la impresora no soporta nada de lo anterior, esperará al timeout (30s) por seguridad.
 			return false
 		}
 
-		fresh, drained, err := usbraw.SendPJLAndRead(path, pjlCmd, timeoutMs, isComplete)
+		fresh, drained, err := usbraw.SendPJLAndRead(path, pjlCmd, cmdTimeout, isComplete)
 		if err != nil {
 			log.Printf("[PJL-Raw] %s: %v", path, err)
 			continue
 		}
 
-		resFresh := parsePJL(fresh)
+		resFresh := parsePJL(fresh, profile)
 		var combined []byte
 		var source string
-		if resFresh.Model != "" && (len(resFresh.Supplies) > 0 || resFresh.PageCount > 0) {
-			// La respuesta fresca está completa. Descartamos el buffer previo porque podría
-			// estar corrupto o pisado por el spooler.
+		if resFresh.Model != "" && (!profile.ShouldParseSupplies() || len(resFresh.Supplies) > 0 || resFresh.PageCount > 0) {
 			combined = fresh
 			source = fmt.Sprintf("%d bytes frescos", len(fresh))
 			if len(drained) > 0 {
 				log.Printf("[PJL-Raw] Descartando %d bytes previos (fresca ya está completa)", len(drained))
 			}
 		} else {
-			// Combinar drained + fresh como fallback (modo sin bypass spooler)
 			combined = append(drained, fresh...)
 			if len(combined) == 0 {
 				continue
@@ -197,9 +241,9 @@ func tryUSBRaw(pjlCmd string, timeoutMs int) (*Result, error) {
 			}
 		}
 
-		res := parsePJL(combined)
+		res := parsePJL(combined, profile)
 		if res.Model != "" || res.PageCount != 0 || len(res.Supplies) != 0 || res.Status != "" || res.Serial != "" {
-			log.Printf("[PJL-Raw] %s → datos OK (%s)", path, source)
+			log.Printf("[PJL-Raw] %s → datos OK con perfil %s (%s)", path, profile.Name(), source)
 			return res, nil
 		}
 		log.Printf("[PJL-Raw] %s bytes combinados no son PJL estándar — ver dump", source)
@@ -208,7 +252,7 @@ func tryUSBRaw(pjlCmd string, timeoutMs int) (*Result, error) {
 	return nil, fmt.Errorf("USB raw: ningún device respondió datos PJL")
 }
 
-func tryPortMonitor(portWithColon string, timeoutMs int) (*Result, error) {
+func tryPortMonitor(portWithColon string, timeoutMs int, profile BrandProfile) (*Result, error) {
 	handle, err := winOpenPrinter(portWithColon)
 	if err != nil {
 		return nil, fmt.Errorf("port monitor %s: %w", portWithColon, err)
@@ -217,7 +261,7 @@ func tryPortMonitor(portWithColon string, timeoutMs int) (*Result, error) {
 
 	log.Printf("[PJL] Puerto monitor abierto: %s", portWithColon)
 
-	pjlCmd := buildPJLQuery()
+	pjlCmd := profile.BuildPJLCommands()
 	cmdBytes := []byte(pjlCmd)
 	var written uint32
 	r, _, e := procWritePrinter.Call(
@@ -247,11 +291,11 @@ func tryPortMonitor(portWithColon string, timeoutMs int) (*Result, error) {
 	}
 
 	log.Printf("[PJL] Respuesta recibida: %d bytes", readBytes)
-	return parsePJL(buf[:readBytes]), nil
+	return parsePJL(buf[:readBytes], profile), nil
 }
 
 // extractViaSpool envía PJL como job RAW e intenta leer la respuesta bidireccional.
-func extractViaSpool(printerName string, timeoutMs int) (*Result, error) {
+func extractViaSpool(printerName string, timeoutMs int, profile BrandProfile) (*Result, error) {
 	handle, err := winOpenPrinter(printerName)
 	if err != nil {
 		return nil, fmt.Errorf("OpenPrinter(%q): %w", printerName, err)
@@ -281,7 +325,7 @@ func extractViaSpool(printerName string, timeoutMs int) (*Result, error) {
 	}
 	defer procEndPagePrinter.Call(uintptr(handle))
 
-	pjlCmd := buildPJLQuery()
+	pjlCmd := profile.BuildPJLCommands()
 	cmdBytes := []byte(pjlCmd)
 	var written uint32
 	r, _, e = procWritePrinter.Call(
@@ -297,7 +341,9 @@ func extractViaSpool(printerName string, timeoutMs int) (*Result, error) {
 
 	// Esperar respuesta
 	wait := time.Duration(timeoutMs) * time.Millisecond
-	if wait < time.Second {
+	if profile.Name() == "HP Samsung-Heritage" {
+		wait = 2 * time.Second
+	} else if wait < time.Second {
 		wait = time.Second
 	}
 	time.Sleep(wait)
@@ -317,29 +363,7 @@ func extractViaSpool(printerName string, timeoutMs int) (*Result, error) {
 	}
 
 	log.Printf("[PJL] Respuesta recibida: %d bytes", readBytes)
-	return parsePJL(buf[:readBytes]), nil
-}
-
-func buildPJLQuery() string {
-	// Order matters: BRSUPPLY and PAGECOUNT come before the large VARIABLES block.
-	// Brother HL-series returns "?" for standard SUPPLIES but responds to BRSUPPLY.
-	// VARIABLES generates a huge response (~4KB+) that can overflow read buffers if placed first.
-	return uel + "@PJL" + crlf +
-		"@PJL INFO ID" + crlf +
-		"@PJL INFO STATUS" + crlf +
-		"@PJL INFO SUPPLIES" + crlf +
-		"@PJL INFO BRSUPPLY" + crlf +
-		"@PJL INFO PRODINFO" + crlf +
-		"@PJL INFO NETWORK" + crlf +
-		"@PJL INFO BRNETINFO" + crlf +
-		"@PJL INQUIRE IPADDRESS" + crlf +
-		"@PJL INQUIRE IPV4" + crlf +
-		"@PJL INQUIRE MACADDRESS" + crlf +
-		"@PJL DINQUIRE PAGECOUNT" + crlf +
-		"@PJL INQUIRE PAGECOUNT" + crlf +
-		"@PJL INFO CONFIG" + crlf +
-		"@PJL INFO VARIABLES" + crlf +
-		uel
+	return parsePJL(buf[:readBytes], profile), nil
 }
 
 // ── Win32 helpers ──────────────────────────────────────────────────────────
@@ -367,9 +391,8 @@ func winClosePrinter(handle syscall.Handle) {
 
 // ── Parser PJL ─────────────────────────────────────────────────────────────
 
-// parsePJL analiza la respuesta cruda PJL.
-// Maneja los bytes especiales de Samsung: \x00 = separador de subsección, \x0C = fin de bloque.
-func parsePJL(data []byte) *Result {
+// parsePJL analiza la respuesta cruda PJL usando las reglas del perfil detectado.
+func parsePJL(data []byte, profile BrandProfile) *Result {
 	// Samsung usa \x00 como separador de subsección en CONFIG; lo reemplazamos con \n
 	clean := bytes.ReplaceAll(data, []byte{0x00}, []byte("\n"))
 	// \x0C (form feed) = fin de bloque PJL → tratarlo como separador también
@@ -469,34 +492,40 @@ func parsePJL(data []byte) *Result {
 				normalCodes := map[string]bool{"10000": true, "10001": true, "40000": true}
 				if val != "" && !normalCodes[val] {
 					res.Alerts = append(res.Alerts, payload.Alert{
-						Code:    val,
-						Message: "PJL status code: " + val,
-						Level:   "warning",
+						ID:         val,
+						Type:       "device",
+						Severity:   "warning",
+						Message:    "PJL status code: " + val,
+						DetectedAt: time.Now().UTC().Format(time.RFC3339),
 					})
 				}
 			case "DISPLAY":
-				res.Status = strings.Trim(val, `"`)
+				res.Display = strings.Trim(val, `"`)
 			case "ONLINE":
 				res.Online = strings.EqualFold(val, "TRUE")
 			case "FMU":
 				// Samsung: Fusing Maintenance Unit status (GOOD/WARNING/REPLACE)
 				if !strings.EqualFold(val, "GOOD") && val != "" {
 					res.Alerts = append(res.Alerts, payload.Alert{
-						Code:    "FMU_" + strings.ToUpper(val),
-						Message: "Unidad de fusión: " + val,
-						Level:   "warning",
+						ID:         "FMU_" + strings.ToUpper(val),
+						Type:       "device",
+						Severity:   "warning",
+						Message:    "Unidad de fusión: " + val,
+						DetectedAt: time.Now().UTC().Format(time.RFC3339),
 					})
 				}
 			}
 
 		// ── INFO SUPPLIES ─────────────────────────────────────────────────
 		case "SUPPLIES":
+			if !profile.ShouldParseSupplies() {
+				break
+			}
 			// Formato estructurado (HP/Xerox/Ricoh estándar)
 			switch key {
 			case "LABEL":
 				flush()
 				cur = &supplyInProgress{Name: strings.Trim(val, `"`)}
-				res.Confidence = "pjl_full"
 			case "COLORANT":
 				if cur != nil {
 					cur.Color = strings.ToLower(val)
@@ -513,6 +542,14 @@ func parsePJL(data []byte) *Result {
 				if cur != nil {
 					cur.Level, _ = strconv.ParseInt(val, 10, 64)
 				}
+			case "PARTNUMBER", "CARTRIDGE", "MODEL":
+				if cur != nil {
+					cur.Model = strings.Trim(val, `" `)
+				}
+			case "SERIALNUMBER", "SERIAL":
+				if cur != nil {
+					cur.SerialNumber = strings.Trim(val, `" `)
+				}
 			default:
 				// Formato simple: TONER=75 o BLACK=75
 				if strings.Contains(key, "TONER") || strings.Contains(key, "BLACK") {
@@ -520,7 +557,6 @@ func parsePJL(data []byte) *Result {
 						flush()
 						cur = &supplyInProgress{Name: "Black Toner", Color: "black", Type: "toner", Level: lvl}
 						flush()
-						res.Confidence = "pjl_full"
 					}
 				}
 			}
@@ -546,7 +582,7 @@ func parsePJL(data []byte) *Result {
 				name := trimmed
 				res.Trays = append(res.Trays, payload.Tray{
 					Name:   normalizeTrayName(name),
-					Status: "OK",
+					Status: "ok",
 				})
 				continue
 			}
@@ -572,6 +608,9 @@ func parsePJL(data []byte) *Result {
 		// ── DINQUIRE/INQUIRE PAGECOUNT ────────────────────────────────────
 		case "DINQUIRE_PAGECOUNT", "DINQUIRE_TOTALPAGECOUNT",
 			"INQUIRE_PAGECOUNT", "INQUIRE_TOTALPAGECOUNT":
+			if !profile.ShouldParseCounters() {
+				break
+			}
 			v := val
 			if v == "" {
 				v = trimmed
@@ -625,10 +664,10 @@ func parsePJL(data []byte) *Result {
 					case "DEFAULT", "AUTO", "AUTOSELECT", "MANUAL", "MANUALFEED":
 						// no es bandeja física
 					case "MPF", "MPTRAY":
-						res.Trays = append(res.Trays, payload.Tray{Name: "Manual Paper Tray", Status: "OK"})
+						res.Trays = append(res.Trays, payload.Tray{Name: "Manual Paper Tray", Status: "ok"})
 					default:
 						if strings.HasPrefix(strings.ToUpper(trimmed), "TRAY") {
-							res.Trays = append(res.Trays, payload.Tray{Name: normalizeTrayName(trimmed), Status: "OK"})
+							res.Trays = append(res.Trays, payload.Tray{Name: normalizeTrayName(trimmed), Status: "ok"})
 						}
 					}
 				}
@@ -645,7 +684,7 @@ func parsePJL(data []byte) *Result {
 				varSub = "mediasource"
 			}
 			// Extraer valor si está inline: PAGECOUNT=12345 [1 RANGE ...]
-			if strings.Contains(upper, "PAGECOUNT") || strings.Contains(upper, "TOTALPAGE") {
+			if profile.ShouldParseCounters() && (strings.Contains(upper, "PAGECOUNT") || strings.Contains(upper, "TOTALPAGE")) {
 				// El valor puede estar antes del bracket: KEY=VALUE [range]
 				valClean := val
 				if idx := strings.Index(valClean, "["); idx != -1 {
@@ -670,7 +709,7 @@ func parsePJL(data []byte) *Result {
 					res.IP = valClean
 				}
 			}
-			if strings.Contains(upper, "TONER") || strings.Contains(upper, "SUPPLY") {
+			if profile.ShouldParseSupplies() && (strings.Contains(upper, "TONER") || strings.Contains(upper, "SUPPLY")) {
 				valClean := val
 				if idx := strings.Index(valClean, "["); idx != -1 {
 					valClean = strings.TrimSpace(valClean[:idx])
@@ -684,9 +723,9 @@ func parsePJL(data []byte) *Result {
 							Name:       key,
 							Color:      "black",
 							Type:       "toner",
+							Category:   "toner",
 							Percentage: payload.Float64Ptr(float64(pct)),
 						})
-						res.Confidence = "pjl_full"
 					}
 				}
 			}
@@ -694,9 +733,16 @@ func parsePJL(data []byte) *Result {
 	}
 
 	flush()
-	if brData != nil {
+	if profile.ShouldParseSupplies() && brData != nil {
 		applyBRSupplyData(res, brData)
 	}
+
+	// Usar el perfil para determinar el nivel de confianza final
+	res.Confidence = profile.DetermineConfidence(len(res.Supplies) > 0, res.PageCount > 0)
+
+	// Extraer respuestas PML si existen (especial para HP Laser 408dn)
+	ExtractPML(data, res)
+
 	return res
 }
 
@@ -717,11 +763,13 @@ func normalizeTrayName(raw string) string {
 }
 
 type supplyInProgress struct {
-	Name        string
-	Color       string
-	Type        string
-	Level       int64
-	MaxCapacity int64
+	Name         string
+	Color        string
+	Type         string
+	Level        int64
+	MaxCapacity  int64
+	Model        string
+	SerialNumber string
 }
 
 func (s *supplyInProgress) build() payload.Supply {
@@ -734,7 +782,7 @@ func (s *supplyInProgress) build() payload.Supply {
 		levelPct = &pct
 	}
 
-	status := "OK"
+	status := "ok"
 	if levelPct != nil {
 		switch {
 		case *levelPct <= 10:
@@ -748,12 +796,28 @@ func (s *supplyInProgress) build() payload.Supply {
 	if color == "" {
 		color = "black"
 	}
+
+	var model *string
+	if s.Model != "" && s.Model != "?" {
+		m := s.Model
+		model = &m
+	}
+
+	var sn *string
+	if s.SerialNumber != "" && s.SerialNumber != "?" {
+		ser := s.SerialNumber
+		sn = &ser
+	}
+
 	return payload.Supply{
-		Name:       s.Name,
-		Type:       s.Type,
-		Color:      color,
-		Percentage: payload.Float64Ptr(float64(*levelPct)),
-		Status:     status,
+		Name:         s.Name,
+		Type:         s.Type,
+		Category:     s.Type,
+		Color:        color,
+		Percentage:   payload.Float64Ptr(float64(*levelPct)),
+		Status:       status,
+		Model:        model,
+		SerialNumber: sn,
 	}
 }
 
@@ -804,9 +868,20 @@ func applyBRSupplyData(res *Result, d map[string]string) {
 			res.PrintPages = n
 		}
 	}
-	if v := get("LAS_PAGECOUNT_OTHER"); v != "" && res.CopyPages == 0 {
+	if v := get("LAS_PAGECOUNT_OTHER"); v != "" && res.ReportsPages == 0 {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-			res.CopyPages = n
+			res.ReportsPages = n
+		}
+	}
+	// Color/Mono counters
+	if v := get("LAS_PAGECOUNT_MONO"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			res.MonoPages = n
+		}
+	}
+	if v := get("LAS_PAGECOUNT_COLOR"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			res.ColorPages = n
 		}
 	}
 	if v := get("LAS_PAGECOUNT_TOTAL_DX"); v != "" {
@@ -820,7 +895,8 @@ func applyBRSupplyData(res *Result, d map[string]string) {
 			res.DuplexSet = true
 		}
 	}
-	if v := get("LAS_SCANNER_PAGE_COUNT"); v != "" && res.ScanPages == 0 {
+	// Document Scan count (ADF/Flatbed)
+	if v := get("LAS_SCAN_PAGE_COUNT"); v != "" && res.ScanPages == 0 {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 			res.ScanPages = n
 		}
@@ -928,6 +1004,7 @@ func applyBRSupplyData(res *Result, d map[string]string) {
 				ID:            fmt.Sprintf("toner_black_.1.%d", len(res.Supplies)+1),
 				Name:          "Toner Black",
 				Type:          "toner",
+				Category:      "toner",
 				Color:         "black",
 				Description:   "Black Toner Cartridge",
 				Percentage:    payload.Float64Ptr(float64(pct)),
@@ -957,17 +1034,42 @@ func applyBRSupplyData(res *Result, d map[string]string) {
 				}
 				rawL := int(r)
 				rawM := int(l)
+				var genuine *bool
+				if gk := get("LAS_DRUM_GENUINE_K"); gk != "" {
+					gen := gk == "1"
+					genuine = &gen
+				}
+				var changeCount *int
+				if cc := get("LAS_DRUM_CHANGE_COUNT"); cc != "" {
+					if c, err := strconv.Atoi(cc); err == nil {
+						changeCount = &c
+					}
+				}
+				var CartridgeType *string
+				if pt := get("LAS_DRUM_CHANGE_TYPE1"); pt != "" {
+					CartridgeType = &pt
+				}
+				var sn *string
+				if sv := get("LAS_DRUM_SN"); sv != "" && sv != "?" {
+					sn = &sv
+				}
+
 				res.Supplies = append(res.Supplies, payload.Supply{
-					ID:           fmt.Sprintf("drum_.1.%d", len(res.Supplies)+1),
-					Name:         "Drum Black",
-					Description:  "Black Drum Unit",
-					Type:         "drum",
-					Color:        "black",
-					Percentage:   payload.Float64Ptr(float64(pct)),
-					Status:       brSupplyStatus(pct),
-					IsMeasurable: true,
-					RawLevel:     &rawL,
-					RawMax:       &rawM,
+					ID:            fmt.Sprintf("drum_.1.%d", len(res.Supplies)+1),
+					Name:          "Drum Black",
+					Description:   "Black Drum Unit",
+					Type:          "drum",
+					Category:      "drum",
+					Color:         "black",
+					Percentage:    payload.Float64Ptr(float64(pct)),
+					Status:        brSupplyStatus(pct),
+					IsMeasurable:  true,
+					RawLevel:      &rawL,
+					RawMax:        &rawM,
+					Genuine:       genuine,
+					ChangeCount:   changeCount,
+					CartridgeType: CartridgeType,
+					SerialNumber:  sn,
 				})
 			}
 		}
@@ -1002,11 +1104,16 @@ func applyBRSupplyData(res *Result, d map[string]string) {
 		}
 		rawL := int(r)
 		rawM := int(l)
+		cat := k.typ
+		if cat == "maintenance" {
+			cat = "other"
+		}
 		res.Supplies = append(res.Supplies, payload.Supply{
 			ID:           fmt.Sprintf("%s_.1.%d", k.typ, len(res.Supplies)+1),
 			Name:         k.name,
 			Description:  k.name,
 			Type:         k.typ,
+			Category:     cat,
 			Color:        "n/a",
 			Percentage:   payload.Float64Ptr(float64(pct)),
 			Status:       brSupplyStatus(pct),
@@ -1020,11 +1127,11 @@ func applyBRSupplyData(res *Result, d map[string]string) {
 func brSupplyStatus(pct int) string {
 	switch {
 	case pct <= 10:
-		return "Cr\u00edtico"
+		return "cr\u00edtico"
 	case pct <= 25:
-		return "Bajo"
+		return "bajo"
 	default:
-		return "OK"
+		return "ok"
 	}
 }
 

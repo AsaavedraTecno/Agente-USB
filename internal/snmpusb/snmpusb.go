@@ -11,19 +11,21 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gosnmp/gosnmp"
 	"usb-agent/internal/payload"
+
+	"github.com/gosnmp/gosnmp"
 )
 
 // OIDs del Printer MIB (RFC 3805) y MIB-II usados en la extracción
 const (
-	oidSysDescr   = ".1.3.6.1.2.1.1.1.0"
-	oidSysName    = ".1.3.6.1.2.1.1.5.0"
-	oidPrtModel   = ".1.3.6.1.2.1.43.5.1.1.16.1"
-	oidPrtSerial  = ".1.3.6.1.2.1.43.5.1.1.17.1"
-	oidLifeCount  = ".1.3.6.1.2.1.43.10.2.1.4.1.1"
-	oidHrDescr    = ".1.3.6.1.2.1.25.3.2.1.3.1"
-	oidIfMAC      = ".1.3.6.1.2.1.2.2.1.6.1"
+	oidSysDescr  = ".1.3.6.1.2.1.1.1.0"
+	oidSysName   = ".1.3.6.1.2.1.1.5.0"
+	oidPrtModel  = ".1.3.6.1.2.1.43.5.1.1.16.1"
+	oidPrtSerial = ".1.3.6.1.2.1.43.5.1.1.17.1"
+	oidLifeCount = ".1.3.6.1.2.1.43.10.2.1.4.1.1"
+	oidHrDescr   = ".1.3.6.1.2.1.25.3.2.1.3.1"
+	oidIfMAC     = ".1.3.6.1.2.1.2.2.1.6.1"
+	oidDisplay   = ".1.3.6.1.2.1.43.16.5.1.2.1.1"
 )
 
 // OIDs de insumos (supply slots 1..4)
@@ -42,6 +44,7 @@ type Result struct {
 	Brand      string
 	Serial     string
 	MAC        string
+	Display    string
 	TotalPages int64
 	Supplies   []payload.Supply
 	Alerts     []payload.Alert
@@ -81,7 +84,7 @@ func Extract(ip, community string, timeoutMs int) (*Result, error) {
 	log.Printf("[SNMP-USB] Extrayendo datos de %s...", ip)
 
 	// ── Consulta principal ─────────────────────────────────────────────────
-	mainOIDs := []string{oidSysDescr, oidSysName, oidPrtModel, oidPrtSerial, oidLifeCount, oidHrDescr, oidIfMAC}
+	mainOIDs := []string{oidSysDescr, oidSysName, oidPrtModel, oidPrtSerial, oidLifeCount, oidHrDescr, oidIfMAC, oidDisplay}
 	resp, err := g.Get(mainOIDs)
 	if err != nil {
 		return nil, fmt.Errorf("SNMP GET: %w", err)
@@ -115,6 +118,8 @@ func Extract(ip, community string, timeoutMs int) (*Result, error) {
 			}
 		case 6:
 			res.MAC = formatMAC(v)
+		case 7:
+			res.Display = oidStr(v)
 		}
 	}
 
@@ -173,7 +178,7 @@ func extractSupplies(g *gosnmp.GoSNMP) []payload.Supply {
 			levelPct = &pct
 		}
 
-		status := "OK"
+		status := "ok"
 		if levelPct != nil {
 			switch {
 			case *levelPct <= 10:
@@ -186,6 +191,7 @@ func extractSupplies(g *gosnmp.GoSNMP) []payload.Supply {
 		supplies = append(supplies, payload.Supply{
 			Name:       desc,
 			Type:       "toner",
+			Category:   "toner",
 			Color:      "black",
 			Percentage: payload.Float64Ptr(float64(*levelPct)),
 			Status:     status,

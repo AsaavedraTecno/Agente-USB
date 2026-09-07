@@ -5,6 +5,7 @@ import (
 	"log"
 	"os/exec"
 	"strings"
+	"syscall"
 )
 
 // USBPrinter representa una impresora detectada en el sistema vía puerto USB.
@@ -21,6 +22,7 @@ func FindUSBPrinters() []USBPrinter {
 			`Where-Object { $_.PortName -like 'USB*' -and $_.WorkOffline -eq $false } | `+
 			`Select-Object Name, PortName, DriverName | `+
 			`ConvertTo-Json -Compress`)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 
 	out, err := cmd.Output()
 	if err != nil {

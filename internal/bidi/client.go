@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"syscall"
 	"time"
 
 	"usb-agent/internal/payload"
@@ -44,7 +45,9 @@ $p | Select-Object PropertyName, @{N='Value';E={[string]$_.Value}} | ConvertTo-J
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command", script).Output()
+	psCmd := exec.CommandContext(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command", script)
+	psCmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	out, err := psCmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("Get-PrinterProperty: %w", err)
 	}
@@ -77,6 +80,26 @@ func parsePrinterProperties(raw string) (*Result, error) {
 	}
 
 	res := &Result{}
+	var cartridgeModel *string
+	var cartridgeSerial *string
+
+	// First pass: look for global cartridge identifiers
+	for _, p := range props {
+		name := strings.ToLower(p.PropertyName)
+		val := strings.TrimSpace(p.Value)
+		if val == "" || val == "?" {
+			continue
+		}
+		if strings.Contains(name, "partnumber") || strings.Contains(name, "cartridgemodel") {
+			m := val
+			cartridgeModel = &m
+		}
+		if strings.Contains(name, "cartridgeserial") {
+			s := val
+			cartridgeSerial = &s
+		}
+	}
+
 	for _, p := range props {
 		name := strings.ToLower(p.PropertyName)
 		val := strings.TrimSpace(p.Value)
@@ -94,11 +117,14 @@ func parsePrinterProperties(raw string) (*Result, error) {
 			var lvl int
 			if n, _ := fmt.Sscanf(val, "%d", &lvl); n == 1 && lvl >= 0 && lvl <= 100 {
 				res.Supplies = append(res.Supplies, payload.Supply{
-					Name:       p.PropertyName,
-					Color:      "black",
-					Type:       "toner",
-					Percentage: payload.Float64Ptr(float64(lvl)),
-					Status:     supplyStatus(lvl),
+					Name:         p.PropertyName,
+					Color:        "black",
+					Type:         "toner",
+					Category:     "toner",
+					Percentage:   payload.Float64Ptr(float64(lvl)),
+					Status:       supplyStatus(lvl),
+					Model:        cartridgeModel,
+					SerialNumber: cartridgeSerial,
 				})
 			}
 		}
@@ -113,75 +139,60 @@ func parsePrinterProperties(raw string) (*Result, error) {
 // ── Método 2: IBidiSpl COM via C# Add-Type ────────────────────────────────────
 
 // csharpBidi es código C# compilado en memoria por PowerShell Add-Type.
-// Usa IBidiSpl2 (bidispl.dll, Windows 8+): interfaz XML más simple que IBidiSpl v1.
-// CLSIDs registrados en HKLM\SOFTWARE\Classes\CLSID como "Bidi Spooler APIs":
-//   {2A614240-A4C5-4C33-BD87-1BC709331639} → InprocServer32 = bidispl.dll
-//   {B9162A23-45F9-47CC-80F5-FE0FE9B9E1A2}
-//   {FC5B8A24-DB05-4A01-8388-22EDF6C2BBBA}
-// IID_IBidiSpl2 = {D9B3B463-DEF7-4C56-B61A-8CAE77EB3ABD} (bidispl.h, Windows 10 SDK)
+// Usa IBidiSpl v1 (compatible con todos los Windows y drivers antiguos).
 const csharpBidi = `
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Text;
-using System.Xml;
 
-// IBidiSpl2: interfaz moderna (Windows 8+) con BindDevice + SendRecvXMLString
-[ComImport, Guid("D9B3B463-DEF7-4C56-B61A-8CAE77EB3ABD"),
- InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-public interface IBidiSpl2 {
+[ComImport, Guid("05121968-360B-4F8B-A36C-624D6F973686"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IBidiSpl {
     [PreserveSig] int BindDevice([MarshalAs(UnmanagedType.LPWStr)] string pszDeviceName, uint dwAccess);
     [PreserveSig] int UnbindDevice();
-    [PreserveSig] int SendRecvXMLString(
-        [MarshalAs(UnmanagedType.BStr)] string bstrRequest,
-        [MarshalAs(UnmanagedType.BStr)] out string pbstrResponse);
-    [PreserveSig] int SendRecvXMLStream(IntPtr pSRequest, out IntPtr ppSResponse);
+    [PreserveSig] int SendRecv([MarshalAs(UnmanagedType.LPWStr)] string pszAction, IBidiRequest pRequest, out IBidiRequest ppResponse);
+    [PreserveSig] int MultiSendRecv([MarshalAs(UnmanagedType.LPWStr)] string pszAction, IntPtr pRequestContainer, out IntPtr ppResponseContainer);
+}
+
+[ComImport, Guid("D79C53E4-0E39-4328-B521-6F5D92C23C5E"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IBidiRequest {
+    [PreserveSig] int SetSchema([MarshalAs(UnmanagedType.LPWStr)] string pszSchema);
+    [PreserveSig] int SetInputData(uint dwType, IntPtr pData, uint uSize);
+    [PreserveSig] int GetResult(out int phrValidData);
+    [PreserveSig] int GetOutputData(uint dwIndex, [MarshalAs(UnmanagedType.LPWStr)] out string ppszSchema, out uint pdwType, out IntPtr ppData, out uint puSize);
+    [PreserveSig] int GetEnumCount(out uint pdwTotal);
 }
 
 public static class BidiExtractor {
     const uint BIDI_ACCESS_USER = 0x00000001;
-    const string BidiNs = "http://schemas.microsoft.com/windows/2005/03/printing/bidi";
 
     static readonly string[] Schemas = {
         @"\Printer.Supplies#1.Level",
         @"\Printer.Supplies#1.MaxCapacity",
         @"\Printer.Supplies#1.ColorantName",
+        @"\Printer.Supplies#1.PartNumber",
+        @"\Printer.Supplies#1.ModelName",
+        @"\Printer.Supplies#1.SerialNumber",
         @"\Printer.Supplies#2.Level",
         @"\Printer.Supplies#2.MaxCapacity",
         @"\Printer.Supplies#2.ColorantName",
+        @"\Printer.Supplies#2.PartNumber",
+        @"\Printer.Supplies#2.ModelName",
+        @"\Printer.Supplies#2.SerialNumber",
         @"\Printer.PageCount.Value",
         @"\Printer.DeviceInfo:SerialNumber",
         @"\Printer.Status.Summary",
     };
 
-    // Intenta instanciar IBidiSpl2 probando los tres CLSIDs registrados ("Bidi Spooler APIs").
-    // Nota: estos CLSIDs (bidispl.dll) son proxies del spooler; si ninguno implementa
-    // IBidiSpl2, es porque el acceso requiere contexto interno del print spooler.
-    static IBidiSpl2 CreateBidiSpl2() {
-        var clsids = new[] {
-            new Guid("2A614240-A4C5-4C33-BD87-1BC709331639"),
-            new Guid("B9162A23-45F9-47CC-80F5-FE0FE9B9E1A2"),
-            new Guid("FC5B8A24-DB05-4A01-8388-22EDF6C2BBBA"),
-        };
-        var tried = new System.Collections.Generic.List<string>();
-        foreach (var clsid in clsids) {
-            try {
-                var t = Type.GetTypeFromCLSID(clsid, true);
-                var obj = Activator.CreateInstance(t);
-                var spl = obj as IBidiSpl2;
-                if (spl != null) return spl;
-                tried.Add(clsid.ToString() + ":E_NOINTERFACE");
-            } catch (Exception ex) { tried.Add(clsid.ToString() + ":" + ex.HResult.ToString("X")); }
-        }
-        throw new Exception("IBidiSpl2 no accesible (CLSIDs probados: " + string.Join(", ", tried) + ")");
-    }
-
     public static string Run(string printerName) {
-        IBidiSpl2 spl;
+        var clsSpl = new Guid("2A614240-A4C5-4C33-BD87-1BC709331639");
+        var clsReq = new Guid("B9162A23-45F9-47CC-80F5-FE0FE9B9E1A2");
+
+        IBidiSpl spl = null;
         try {
-            spl = CreateBidiSpl2();
+            spl = (IBidiSpl)Activator.CreateInstance(Type.GetTypeFromCLSID(clsSpl, true));
         } catch (Exception ex) {
-            return "{\"_error\":\"CreateBidiSpl2: " + Esc(ex.Message) + "\"}";
+            return "{\"_error\":\"CreateBidiSpl: " + Esc(ex.Message) + "\"}";
         }
 
         int hr = spl.BindDevice(printerName, BIDI_ACCESS_USER);
@@ -189,41 +200,45 @@ public static class BidiExtractor {
             return "{\"_error\":\"BindDevice HRESULT=0x" + hr.ToString("X8") + "\"}";
         }
 
-        // Construir petición XML con todos los schemas
-        var xmlReq = new StringBuilder();
-        xmlReq.Append("<bidi:Get xmlns:bidi=\"").Append(BidiNs).Append("\">");
-        foreach (var s in Schemas)
-            xmlReq.Append("<Query schema=\"").Append(s).Append("\"/>");
-        xmlReq.Append("</bidi:Get>");
+        var results = new Dictionary<string, string>();
 
-        string xmlResp = null;
-        hr = spl.SendRecvXMLString(xmlReq.ToString(), out xmlResp);
-        spl.UnbindDevice();
-
-        if (hr < 0 || string.IsNullOrEmpty(xmlResp)) {
-            return "{\"_error\":\"SendRecvXMLString HRESULT=0x" + hr.ToString("X8") + "\"}";
+        foreach (var schema in Schemas) {
+            try {
+                IBidiRequest req = (IBidiRequest)Activator.CreateInstance(Type.GetTypeFromCLSID(clsReq, true));
+                req.SetSchema(schema);
+                IBidiRequest resp;
+                hr = spl.SendRecv("Get", req, out resp);
+                if (hr >= 0 && resp != null) {
+                    int valid = -1;
+                    resp.GetResult(out valid);
+                    if (valid == 0) { // 0 = S_OK
+                        uint count = 0;
+                        resp.GetEnumCount(out count);
+                        for (uint i = 0; i < count; i++) {
+                            string outSchema;
+                            uint type;
+                            IntPtr pData;
+                            uint size;
+                            if (resp.GetOutputData(i, out outSchema, out type, out pData, out size) == 0) {
+                                string valStr = "";
+                                if (type == 1) { // BIDI_INT
+                                    valStr = Marshal.ReadInt32(pData).ToString();
+                                } else if (type == 4 || type == 5 || type == 6) { // STRING, TEXT, ENUM
+                                    valStr = Marshal.PtrToStringUni(pData);
+                                } else if (type == 3) { // BOOL
+                                    valStr = Marshal.ReadInt32(pData) == 0 ? "false" : "true";
+                                }
+                                if (!string.IsNullOrEmpty(outSchema) && !string.IsNullOrEmpty(valStr)) {
+                                    results[outSchema] = valStr;
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch {}
         }
 
-        // Parsear respuesta XML (C# 4 compatible: sin ?. ni string interpolation)
-        var results = new Dictionary<string, string>();
-        try {
-            var doc = new XmlDocument();
-            doc.LoadXml(xmlResp);
-            var mgr = new XmlNamespaceManager(doc.NameTable);
-            mgr.AddNamespace("bidi", BidiNs);
-            XmlNodeList nodes = doc.SelectNodes("//Query[@schema]", mgr);
-            foreach (XmlNode query in nodes) {
-                XmlAttribute schemaAttr = query.Attributes["schema"];
-                string schema = (schemaAttr != null) ? schemaAttr.Value : "";
-                string val = "";
-                foreach (XmlNode child in query.ChildNodes) {
-                    string t = (child.InnerText != null) ? child.InnerText.Trim() : "";
-                    if (t != "") { val = t; break; }
-                }
-                if (schema != "" && val != "" && val != "?")
-                    results[schema] = val;
-            }
-        } catch {}
+        spl.UnbindDevice();
 
         var sb = new StringBuilder("{");
         bool first = true;
@@ -260,6 +275,7 @@ else { [BidiExtractor]::Run("%s") }`, csharpBidi, safeName)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command", psScript)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("IBidiSpl COM: %w", err)
@@ -296,6 +312,10 @@ else { [BidiExtractor]::Run("%s") }`, csharpBidi, safeName)
 	for i := 1; i <= 2; i++ {
 		lvlKey := fmt.Sprintf(`\Printer.Supplies#%d.Level`, i)
 		nameKey := fmt.Sprintf(`\Printer.Supplies#%d.ColorantName`, i)
+		pnKey := fmt.Sprintf(`\Printer.Supplies#%d.PartNumber`, i)
+		mnKey := fmt.Sprintf(`\Printer.Supplies#%d.ModelName`, i)
+		snKey := fmt.Sprintf(`\Printer.Supplies#%d.SerialNumber`, i)
+
 		lvlStr, okL := data[lvlKey]
 		if !okL {
 			continue
@@ -308,12 +328,28 @@ else { [BidiExtractor]::Run("%s") }`, csharpBidi, safeName)
 		if supplyName == "" {
 			supplyName = "Black"
 		}
+
+		var model *string
+		if m := data[pnKey]; m != "" && m != "?" {
+			model = &m
+		} else if m := data[mnKey]; m != "" && m != "?" {
+			model = &m
+		}
+
+		var serialNum *string
+		if s := data[snKey]; s != "" && s != "?" {
+			serialNum = &s
+		}
+
 		res.Supplies = append(res.Supplies, payload.Supply{
-			Name:       supplyName + " Toner",
-			Color:      strings.ToLower(supplyName),
-			Type:       "toner",
-			Percentage: payload.Float64Ptr(float64(level)),
-			Status:     supplyStatus(level),
+			Name:         supplyName + " Toner",
+			Color:        strings.ToLower(supplyName),
+			Type:         "toner",
+			Category:     "toner",
+			Percentage:   payload.Float64Ptr(float64(level)),
+			Status:       supplyStatus(level),
+			Model:        model,
+			SerialNumber: serialNum,
 		})
 	}
 
@@ -323,10 +359,10 @@ else { [BidiExtractor]::Run("%s") }`, csharpBidi, safeName)
 func supplyStatus(pct int) string {
 	switch {
 	case pct <= 10:
-		return "Cr\u00edtico"
+		return "cr\u00edtico"
 	case pct <= 25:
-		return "Bajo"
+		return "bajo"
 	default:
-		return "OK"
+		return "ok"
 	}
 }

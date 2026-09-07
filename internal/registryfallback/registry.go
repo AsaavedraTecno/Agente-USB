@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"usb-agent/internal/payload"
 )
@@ -33,7 +34,9 @@ foreach ($p in $paths) {
 $results | Select-Object -Unique
 `
 
-	out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", script).Output()
+	psCmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", script)
+	psCmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	out, err := psCmd.Output()
 	if err != nil {
 		return nil, err
 	}
@@ -78,6 +81,7 @@ func parseRegistryOutput(raw string) []payload.Supply {
 					supplies = append(supplies, payload.Supply{
 						Name:       "Toner (" + color + ")",
 						Type:       "toner",
+						Category:   "toner",
 						Color:      color,
 						Percentage: payload.Float64Ptr(float64(level)),
 						Status:     getStatusForLevel(level),
@@ -92,9 +96,9 @@ func parseRegistryOutput(raw string) []payload.Supply {
 
 func getStatusForLevel(level int) string {
 	if level <= 10 {
-		return "Cr\u00edtico"
+		return "cr\u00edtico"
 	} else if level <= 25 {
-		return "Bajo"
+		return "bajo"
 	}
-	return "OK"
+	return "ok"
 }

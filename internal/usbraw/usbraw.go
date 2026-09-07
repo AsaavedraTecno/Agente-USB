@@ -157,7 +157,17 @@ func FindDevicePaths() ([]string, error) {
 // Si la lectura fresca falla, el llamador puede usar los bytes drenados como fallback —
 // son la respuesta válida de la ejecución anterior (la impresora responde ~5-7 s después
 // de recibir el comando, más de lo que espera el driver en el primer intento).
+// SendPJLAndRead es un wrapper para compatibilidad que envía un string PJL.
 func SendPJLAndRead(devicePath, pjlCmd string, timeoutMs int, isComplete func(data []byte, isIdle bool) bool) (fresh []byte, drained []byte, err error) {
+	return SendRawAndRead(devicePath, []byte(pjlCmd), timeoutMs, isComplete)
+}
+
+// SendRawAndRead abre el device USB con overlapped I/O, envía bytes puros y lee respuesta con timeout.
+// Devuelve (respuesta fresca, bytes drenados del buffer previo, error).
+// Si la lectura fresca falla, el llamador puede usar los bytes drenados como fallback —
+// son la respuesta válida de la ejecución anterior (la impresora responde ~5-7 s después
+// de recibir el comando, más de lo que espera el driver en el primer intento).
+func SendRawAndRead(devicePath string, cmdBytes []byte, timeoutMs int, isComplete func(data []byte, isIdle bool) bool) (fresh []byte, drained []byte, err error) {
 	pathW, convErr := syscall.UTF16PtrFromString(devicePath)
 	if convErr != nil {
 		return nil, nil, convErr
@@ -235,7 +245,6 @@ func SendPJLAndRead(devicePath, pjlCmd string, timeoutMs int, isComplete func(da
 	defer procCloseHandle.Call(wEvent)
 
 	wOv := overlapped{HEvent: syscall.Handle(wEvent)}
-	cmdBytes := []byte(pjlCmd)
 	var written uint32
 
 	r, _, e := procWriteFile.Call(
@@ -365,7 +374,7 @@ func SendPJLAndRead(devicePath, pjlCmd string, timeoutMs int, isComplete func(da
 				0,
 			)
 			procCloseHandle.Call(rEvent)
-			
+
 			// Si leímos datos, conservarlos incluso si r2 == 0 (ej. ERROR_MORE_DATA)
 			if readBytes > 0 {
 				result.Write(buf[:readBytes])
@@ -374,7 +383,7 @@ func SendPJLAndRead(devicePath, pjlCmd string, timeoutMs int, isComplete func(da
 				}
 				continue
 			}
-			
+
 			if r2 != 0 {
 				// 0-byte packet (ZLP). Pause briefly.
 				if isComplete != nil && isComplete(result.Bytes(), true) {
