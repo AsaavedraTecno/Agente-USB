@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +15,13 @@ import (
 	"strings"
 	"time"
 )
+
+// ErrRateLimited distingue un 429 de cualquier otra falla de /agent/config.
+// El caller (winsvc/service.go) lo usa para hacer backoff exponencial en vez
+// de seguir insistiendo cada tickInterval -- /agent/config tiene
+// throttle:120,1 por IP, y varios agentes detrás de la misma IP pueden
+// pisarse el límite en escenarios de mucho volumen.
+var ErrRateLimited = errors.New("agent config: rate limited (429)")
 
 // SendBatch envía un conjunto de archivos JSON empaquetados bajo la clave "readings".
 // Retorna deleteFiles=true si el servidor responde 2xx o 4xx (datos corruptos).
@@ -148,6 +156,9 @@ func FetchConfig(baseURL, apiKey, machineID string, skipTLS bool) (*RemoteConfig
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return nil, ErrRateLimited
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("handshake falló: status %d", resp.StatusCode)
 	}

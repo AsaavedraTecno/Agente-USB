@@ -32,3 +32,33 @@ func ListPending(dir string) ([]string, error) {
 func Remove(path string) error {
 	return os.Remove(path)
 }
+
+// Purge borra los archivos de cola más viejos que maxAge -- sin esto, un
+// agente que pierde contacto con el servidor por mucho tiempo (notebook de
+// baja, servidor caído) llena el disco de a poco, porque Save() nunca deja
+// de escribir. Mismo patrón que AgenteSNMP (pkg/uploader/uploader.go,
+// purgeOldFiles, TTL 3 días).
+func Purge(dir string, maxAge time.Duration) {
+	files, err := filepath.Glob(filepath.Join(dir, "*.json"))
+	if err != nil {
+		return
+	}
+
+	cutoff := time.Now().Add(-maxAge)
+	deleted := 0
+	for _, f := range files {
+		info, err := os.Stat(f)
+		if err != nil {
+			continue
+		}
+		if info.ModTime().Before(cutoff) {
+			if os.Remove(f) == nil {
+				deleted++
+			}
+		}
+	}
+
+	if deleted > 0 {
+		log.Printf("[Queue] Limpieza: %d archivo(s) más viejos que %v eliminados", deleted, maxAge)
+	}
+}

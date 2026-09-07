@@ -1,6 +1,7 @@
 package uploader
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -45,5 +46,20 @@ func TestFetchConfig_SinMachineIdNoMandaElHeader(t *testing.T) {
 
 	if headerPresente {
 		t.Errorf("no debería mandar X-Machine-Id vacío como header")
+	}
+}
+
+// winsvc/service.go distingue 429 de cualquier otra falla para hacer backoff
+// exponencial en vez de seguir insistiendo cada tickInterval -- sin este
+// sentinel específico, un 429 se veía igual que un 500 o un timeout de red.
+func TestFetchConfig_429DevuelveErrRateLimited(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+
+	_, err := FetchConfig(server.URL+"/telemetry", "llave-de-prueba", "", false)
+	if !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("esperaba ErrRateLimited, llegó: %v", err)
 	}
 }
